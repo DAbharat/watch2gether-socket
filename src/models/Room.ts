@@ -1,5 +1,5 @@
 import { Participant } from './Participant.js';
-import { ChatMessage, ParticipantData, Role, RoomState } from '../types.js';
+import { ActionRequest, ChatMessage, ParticipantData, Role, RoomState } from '../types.js';
 
 export const SHADCN_AVATARS: string[] = [
   '/avatars/01.png',
@@ -18,6 +18,7 @@ export class Room {
   lastUpdated: number;
   participants: Map<string, Participant>;
   messages: ChatMessage[];
+  pendingRequests: Map<string, ActionRequest>;
   joinCounter: number = 0;
 
   constructor(id: string, hostSocketId: string, hostUsername: string) {
@@ -29,6 +30,7 @@ export class Room {
     this.lastUpdated = Date.now();
     this.participants = new Map();
     this.messages = [];
+    this.pendingRequests = new Map();
 
     this.addParticipant(hostSocketId, hostUsername, 'host');
   }
@@ -46,9 +48,17 @@ export class Room {
     const participant = this.participants.get(socketId);
     this.participants.delete(socketId);
 
-    // Reassign host if the current host disconnects
+    // Clean up any pending requests made by this user
+    for (const [reqId, req] of this.pendingRequests.entries()) {
+      if (req.requesterId === socketId) {
+        this.pendingRequests.delete(reqId);
+      }
+    }
+
+    // Auto-promote: If host left/disconnected, promote a Moderator first, else first participant
     if (this.hostSocketId === socketId && this.participants.size > 0) {
-      const nextHost = this.participants.values().next().value;
+      const participantsList = Array.from(this.participants.values());
+      const nextHost = participantsList.find((p) => p.role === 'moderator') || participantsList[0];
       if (nextHost) {
         nextHost.role = 'host';
         this.hostSocketId = nextHost.socketId;
@@ -78,13 +88,33 @@ export class Room {
 
     if (newRole === 'host') {
       const currentHost = this.participants.get(this.hostSocketId);
-      if (currentHost) currentHost.role = 'moderator';
+      if (currentHost && currentHost.socketId !== targetSocketId) {
+        currentHost.role = 'moderator';
+      }
       p.role = 'host';
       this.hostSocketId = targetSocketId;
     } else {
       p.role = newRole;
     }
     return p;
+  }
+
+  transferHost(targetSocketId: string): Participant | null {
+    return this.assignRole(targetSocketId, 'host');
+  }
+
+  addActionRequest(request: ActionRequest): void {
+    this.pendingRequests.set(request.requestId, request);
+  }
+
+  getActionRequest(requestId: string): ActionRequest | undefined {
+    return this.pendingRequests.get(requestId);
+  }
+
+  removeActionRequest(requestId: string): ActionRequest | undefined {
+    const req = this.pendingRequests.get(requestId);
+    this.pendingRequests.delete(requestId);
+    return req;
   }
 
   updatePlaybackState({
@@ -102,7 +132,6 @@ export class Room {
     this.lastUpdated = Date.now();
   }
 
-  // Calculates real-time playback offset to keep joining participants synchronized
   getCalculatedCurrentTime(): number {
     if (this.isPlaying) {
       const elapsedSec = (Date.now() - this.lastUpdated) / 1000;

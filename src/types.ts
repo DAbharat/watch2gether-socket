@@ -29,6 +29,15 @@ export interface ChatMessage {
   avatar?: string;
 }
 
+export interface ActionRequest {
+  requestId: string;
+  requesterId: string;
+  requesterName: string;
+  type: 'play' | 'pause' | 'seek' | 'change_video';
+  payload: any;
+  timestamp: number;
+}
+
 export interface UserJoinedPayload {
   username: string;
   userId: string;
@@ -73,10 +82,17 @@ export interface ClientToServerEvents {
   pause: (data: { roomId: string; currentTime: number }) => void;
   seek: (data: { roomId: string; time: number }) => void;
   change_video: (data: { roomId: string; videoId: string }) => void;
-  assign_role: (data: { roomId: string; userId: string; role: Role }) => void;
-  remove_participant: (data: { roomId: string; userId: string }) => void;
+  assign_role: (data: { roomId: string; userId?: string; targetSocketId?: string; role?: Role; newRole?: Role }) => void;
+  remove_participant: (data: { roomId: string; userId?: string; targetSocketId?: string }) => void;
+  kick_user: (data: { roomId: string; targetSocketId?: string; userId?: string }) => void;
+  transfer_host: (data: { roomId: string; userId: string }) => void;
+  request_action: (data: { roomId: string; type: 'play' | 'pause' | 'seek' | 'change_video'; payload?: any }) => void;
+  approve_action: (data: { roomId: string; requestId: string }) => void;
+  deny_action: (data: { roomId: string; requestId: string }) => void;
   send_message: (data: { roomId: string; text: string }) => void;
+  chat_message: (data: { roomId: string; text: string }) => void;
   send_reaction: (data: { roomId: string; emoji: string }) => void;
+  reaction: (data: { roomId: string; emoji: string }) => void;
 }
 
 export interface ServerToClientEvents {
@@ -88,9 +104,18 @@ export interface ServerToClientEvents {
   seek: (data: { time: number }) => void;
   change_video: (data: { videoId: string }) => void;
   role_assigned: (data: RoleAssignedPayload) => void;
+  role_changed: (data: { socketId: string; newRole: Role; hostSocketId: string }) => void;
   participant_removed: (data: ParticipantRemovedPayload) => void;
   kicked: (data: { message: string }) => void;
   new_message: (message: ChatMessage) => void;
+  chat_message: (message: ChatMessage) => void;
   new_reaction: (reaction: ReactionPayload) => void;
+  reaction: (reaction: ReactionPayload) => void;
   error_message: (error: ErrorMessagePayload) => void;
+  error: (error: ErrorMessagePayload) => void;
+  action_requested: (request: ActionRequest) => void;
+  action_request_sent: (data: { message: string; requestId: string }) => void;
+  action_approved: (data: { requestId: string; type: string }) => void;
+  action_denied: (data: { requestId: string; type: string; reason: string }) => void;
+  action_resolved: (data: { requestId: string }) => void;
 }
