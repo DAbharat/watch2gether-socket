@@ -1,6 +1,14 @@
 import { Participant } from './Participant.js';
 import { ChatMessage, ParticipantData, Role, RoomState } from '../types.js';
 
+export const SHADCN_AVATARS: string[] = [
+  '/avatars/01.png',
+  '/avatars/02.png',
+  '/avatars/03.png',
+  '/avatars/04.png',
+  '/avatars/05.png',
+];
+
 export class Room {
   id: string;
   hostSocketId: string;
@@ -10,6 +18,7 @@ export class Room {
   lastUpdated: number;
   participants: Map<string, Participant>;
   messages: ChatMessage[];
+  joinCounter: number = 0;
 
   constructor(id: string, hostSocketId: string, hostUsername: string) {
     this.id = id;
@@ -25,7 +34,10 @@ export class Room {
   }
 
   addParticipant(socketId: string, username: string, role: Role = 'participant'): Participant {
-    const participant = new Participant(socketId, username, role);
+    const avatarIndex = this.joinCounter % SHADCN_AVATARS.length;
+    this.joinCounter++;
+    const avatar = SHADCN_AVATARS[avatarIndex];
+    const participant = new Participant(socketId, username, role, avatar);
     this.participants.set(socketId, participant);
     return participant;
   }
@@ -123,7 +135,8 @@ export class Room {
       username: p ? p.username : 'Unknown',
       role: p ? p.role : 'participant',
       text,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      avatar: p ? p.avatar : SHADCN_AVATARS[0],
     };
     this.messages.push(msg);
     if (this.messages.length > 100) this.messages.shift();

@@ -6,6 +6,7 @@ export interface ParticipantData {
   username: string;
   role: Role;
   joinedAt: number;
+  avatar?: string;
 }
 
 export interface RoomState {
@@ -25,6 +26,7 @@ export interface ChatMessage {
   role: Role;
   text: string;
   timestamp: number;
+  avatar?: string;
 }
 
 export interface UserJoinedPayload {
