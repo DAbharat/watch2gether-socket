@@ -6,7 +6,7 @@ import 'dotenv/config';
 import { roomManager } from './models/RoomManager.js';
 import { Room } from './models/Room.js';
 import { ClientToServerEvents, ServerToClientEvents, Role, ActionRequest } from './types.js';
-import { assignRole, getRole, getAllParticipantRoles, removeParticipantRole } from './config/storage/role.js';
+import { assignRole, getRole, getAllParticipantRoles, removeParticipantRole, getRoomHost, setRoomHost, removeRoomHost } from './config/storage/role.js';
 import { saveMessages, getMessages } from './config/storage/chat.js';
 import { verifyParticipantToken } from './config/storage/participant/participant.js';
 import {
@@ -42,7 +42,7 @@ const isOriginAllowed = (origin: string | undefined): boolean => {
 };
 
 const corsOptions: cors.CorsOptions = {
-  origin: (origin, callback) => {
+  origin: (origin: string | undefined, callback: (err: Error | null, origin?: any) => void) => {
     if (isOriginAllowed(origin)) {
       callback(null, true);
     } else {
@@ -74,7 +74,7 @@ const server = http.createServer(app);
 
 const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
   cors: {
-    origin: (origin, callback) => {
+    origin: (origin: string | undefined, callback: (err: Error | null, origin?: any) => void) => {
       if (isOriginAllowed(origin)) {
         callback(null, true);
       } else {
@@ -103,7 +103,7 @@ function hasPermission(room: Room, socketIdOrUserId: string, action: string): bo
   return allowedRoles ? allowedRoles.includes(participant.role) : false;
 }
 
-function sendError(socket: Socket<any, any>, message: string) {
+function sendError(socket: Socket<ClientToServerEvents, ServerToClientEvents>, message: string) {
   socket.emit('error_message', { message });
   socket.emit('error', { message });
 }
@@ -142,36 +142,33 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     const existingRoom = roomManager.getRoom(cleanRoomId);
     let role: Role = 'participant';
-    try {
-      // Check whether there is an active host currently connected in this room
-      const activeHost = existingRoom && existingRoom.participants.size > 0
-        ? Array.from(existingRoom.participants.values()).find((p) => p.role === 'host')
-        : undefined;
+    let designatedHostId: string | null = null;
 
+    try {
+      designatedHostId = await getRoomHost(cleanRoomId);
       const existingRole = await getRole(cleanRoomId, stableUserId);
 
-      if (existingRole && ['host', 'moderator', 'participant'].includes(existingRole)) {
-        role = existingRole as Role;
-        // If this user has a stored host role, but another user is already the active host in this room
-        if (role === 'host' && activeHost && activeHost.userId !== stableUserId) {
+      if (designatedHostId) {
+        if (stableUserId === designatedHostId) {
+          role = 'host';
+          await assignRole(cleanRoomId, stableUserId, 'host');
+        } else if (existingRole && ['moderator', 'participant'].includes(existingRole)) {
+          role = existingRole as Role;
+        } else {
           role = 'participant';
           await assignRole(cleanRoomId, stableUserId, 'participant');
         }
       } else {
-        // If there is no active host currently connected in the room, the joining user is the host!
-        if (!activeHost) {
-          role = 'host';
-        } else {
-          role = 'participant';
-        }
-
-        await assignRole(cleanRoomId, stableUserId, role);
+        role = 'host';
+        designatedHostId = stableUserId;
+        await setRoomHost(cleanRoomId, stableUserId);
+        await assignRole(cleanRoomId, stableUserId, 'host');
       }
     } catch (err: any) {
       console.error('[Redis] Error fetching/assigning role:', err.message);
-      // Fallback: If Redis is unavailable or empty, the first user in the room is host
       if (!existingRoom || existingRoom.participants.size === 0) {
         role = 'host';
+        designatedHostId = stableUserId;
       }
     }
 
@@ -180,22 +177,13 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       socket.id,
       cleanUsername,
       stableUserId,
-      role
+      role,
+      designatedHostId || undefined
     );
 
-    const currentActiveHost = Array.from(room.participants.values()).find((p) => p.role === 'host');
-    if (!currentActiveHost || room.participants.size === 1) {
-      const p = room.getParticipant(stableUserId);
-      if (p) {
-        p.role = 'host';
-        room.hostUserId = p.userId;
-        room.hostSocketId = p.socketId;
-        try {
-          await assignRole(cleanRoomId, p.userId, 'host');
-        } catch (err: any) {
-          console.error("Assign role error: ", err)
-        }
-      }
+    if (role === 'host') {
+      room.hostUserId = stableUserId;
+      room.hostSocketId = socket.id;
     }
 
     if (room.messages.length === 0) {
@@ -214,7 +202,6 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     socket.emit('sync_state', room.getState());
 
-    // Sync queue and requests on join
     try {
       const queue = await getQueue(cleanRoomId);
       socket.emit('queue_updated', { queue });
@@ -230,11 +217,18 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       console.error('[Redis] Error loading queue/requests on join:', err.message);
     }
 
-    io.to(cleanRoomId).emit('user_joined', {
+    socket.to(cleanRoomId).emit('user_joined', {
       username: participant.username,
       userId: participant.userId,
       role: participant.role,
-      participants: room.getParticipantList()
+      joinedAt: participant.joinedAt,
+      participant: {
+        socketId: socket.id,
+        userId: participant.userId,
+        username: participant.username,
+        role: participant.role,
+        joinedAt: participant.joinedAt
+      }
     });
   });
 
@@ -423,6 +417,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     if (updatedParticipant) {
       try {
         await assignRole(roomId, updatedParticipant.userId, 'host');
+        await setRoomHost(roomId, updatedParticipant.userId);
         if (previousHost && previousHost.userId !== updatedParticipant.userId) {
           await assignRole(roomId, previousHost.userId, 'moderator');
         }
@@ -670,23 +665,57 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     io.to(roomId).emit('action_resolved', { requestId });
   });
 
-  const handleMessage = async ({ roomId, text }: { roomId: string; text: string }) => {
+  const handleMessage = ({ roomId, text }: { roomId: string; text: string }) => {
     const room = roomManager.getRoom(roomId);
     if (!room || !text?.trim()) return;
 
-    const message = room.addMessage(socket.id, text.trim());
-    try {
-      await saveMessages(roomId, message);
-    } catch (err: any) {
-      console.error('[Redis] Error saving message:', err.message);
+    const participant = room.getParticipant(socket.id);
+    if (participant) {
+      socket.to(roomId).emit('user_typing', {
+        userId: participant.userId,
+        username: participant.username,
+        isTyping: false,
+      });
     }
 
-    io.to(roomId).emit('new_message', message);
+    const message = room.addMessage(socket.id, text.trim());
+
     io.to(roomId).emit('chat_message', message);
+    saveMessages(roomId, message).catch((err: any) => {
+      console.error('[Redis] Error saving message:', err?.message);
+    });
   };
 
   socket.on('send_message', handleMessage);
   socket.on('chat_message', handleMessage);
+
+  socket.on('typing_start', ({ roomId }: { roomId: string }) => {
+    if (!roomId) return;
+    const room = roomManager.getRoom(roomId);
+    if (!room) return;
+    const participant = room.getParticipant(socket.id);
+    if (!participant) return;
+
+    socket.to(roomId).emit('user_typing', {
+      userId: participant.userId,
+      username: participant.username,
+      isTyping: true,
+    });
+  });
+
+  socket.on('typing_stop', ({ roomId }: { roomId: string }) => {
+    if (!roomId) return;
+    const room = roomManager.getRoom(roomId);
+    if (!room) return;
+    const participant = room.getParticipant(socket.id);
+    if (!participant) return;
+
+    socket.to(roomId).emit('user_typing', {
+      userId: participant.userId,
+      username: participant.username,
+      isTyping: false,
+    });
+  });
 
   const handleReaction = ({ roomId, emoji }: { roomId: string; emoji: string }) => {
     const room = roomManager.getRoom(roomId);
@@ -699,16 +728,12 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       userId: participant ? participant.userId : socket.id,
       username: participant ? participant.username : 'User'
     };
-    io.to(roomId).emit('new_reaction', payload);
     io.to(roomId).emit('reaction', payload);
   };
 
   socket.on('send_reaction', handleReaction);
   socket.on('reaction', handleReaction);
 
-  // -------------------------------------------------------------
-  // Video Requests & Queue Handling
-  // -------------------------------------------------------------
   socket.on('get_requests', async ({ roomId, participantToken }) => {
     if (!roomId) return;
     const cleanRoomId = roomId.trim();
@@ -752,19 +777,16 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     const participant = room.getParticipant(socket.id);
     if (!participant) return sendError(socket, 'You are not in this room.');
 
-    // Verify token from Redis
     const isTokenValid = await verifyParticipantToken(cleanRoomId, participant.userId, participantToken.trim());
     if (!isTokenValid) {
       return sendError(socket, 'Unauthorized participant token.');
     }
 
-    // Role check from Redis: Only participants submit requests
     const currentRole = await getRole(cleanRoomId, participant.userId);
     if (currentRole !== 'participant') {
       return sendError(socket, 'Host and moderators can change or queue videos directly.');
     }
 
-    // Server-side URL validation
     const validation = validateYouTubeUrl(videoUrl);
     if (!validation.valid || !validation.videoId) {
       return sendError(socket, validation.error || 'Invalid YouTube URL.');
@@ -772,25 +794,21 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     const videoId = validation.videoId;
 
-    // Rate limit: max 5 requests per participant per minute
     const rateOk = await checkRateLimit(cleanRoomId, participant.userId);
     if (!rateOk) {
       return sendError(socket, 'Rate limit exceeded: Max 5 requests per minute.');
     }
 
-    // Max 3 pending requests per participant
     const pendingCount = await getUserPendingCount(cleanRoomId, participant.userId);
     if (pendingCount >= 3) {
       return sendError(socket, 'You already have 3 pending requests. Please wait for them to be reviewed.');
     }
 
-    // Duplicates: ignore if same videoId is already pending or in the queue
     const isDup = await checkDuplicate(cleanRoomId, videoId);
     if (isDup) {
       return sendError(socket, 'This video is already requested or in the queue.');
     }
 
-    // Check queue limit
     const queue = await getQueue(cleanRoomId);
     if (queue.length >= 20) {
       return sendError(socket, 'Queue is currently full (max 20 videos).');
@@ -809,11 +827,9 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     try {
       await saveRequest(cleanRoomId, newRequest);
 
-      // Notify requester
       socket.emit('request_created', { request: newRequest });
       socket.emit('request_notification', { message: 'Video request submitted!', type: 'success' });
 
-      // Send to Host and Moderator sockets only
       for (const [_, p] of room.participants.entries()) {
         if (p.role === 'host' || p.role === 'moderator') {
           const s = io.sockets.sockets.get(p.socketId);
@@ -840,13 +856,11 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     const approver = room.getParticipant(socket.id);
     if (!approver) return sendError(socket, 'You are not in this room.');
 
-    // Verify approver token
     const isTokenValid = await verifyParticipantToken(cleanRoomId, approver.userId, participantToken.trim());
     if (!isTokenValid) {
       return sendError(socket, 'Unauthorized participant token.');
     }
 
-    // Re-check approver's role from Redis at resolve time
     const approverRole = await getRole(cleanRoomId, approver.userId);
     if (approverRole !== 'host' && approverRole !== 'moderator') {
       return sendError(socket, 'Permission denied: Only Host and Moderators can resolve requests.');
@@ -864,12 +878,10 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       reqItem.resolvedBy = approver.username;
       await updateRequest(cleanRoomId, reqItem);
 
-      // Run change_video immediately
       room.updatePlaybackState({ videoId: reqItem.videoId, currentTime: 0, isPlaying: true });
       io.to(cleanRoomId).emit('change_video', { videoId: reqItem.videoId });
       io.to(cleanRoomId).emit('sync_state', room.getState());
 
-      // Notify requester: "Accepted"
       const requesterParticipant = room.participants.get(reqItem.userId);
       if (requesterParticipant) {
         const reqSocket = io.sockets.sockets.get(requesterParticipant.socketId);
@@ -877,7 +889,6 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
         reqSocket?.emit('request_notification', { message: 'Your video request was accepted and is playing now!', type: 'success' });
       }
 
-      // Broadcast update to all hosts/moderators
       for (const [_, p] of room.participants.entries()) {
         if (p.role === 'host' || p.role === 'moderator') {
           io.sockets.sockets.get(p.socketId)?.emit('request_updated', { request: reqItem });
@@ -907,7 +918,6 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       const updatedQueue = await getQueue(cleanRoomId);
       io.to(cleanRoomId).emit('queue_updated', { queue: updatedQueue });
 
-      // Notify requester: "Added to queue"
       const requesterParticipant = room.participants.get(reqItem.userId);
       if (requesterParticipant) {
         const reqSocket = io.sockets.sockets.get(requesterParticipant.socketId);
@@ -915,7 +925,6 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
         reqSocket?.emit('request_notification', { message: 'Your video request was added to the queue!', type: 'success' });
       }
 
-      // Broadcast update to all hosts/moderators
       for (const [_, p] of room.participants.entries()) {
         if (p.role === 'host' || p.role === 'moderator') {
           io.sockets.sockets.get(p.socketId)?.emit('request_updated', { request: reqItem });
@@ -928,7 +937,6 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       reqItem.resolvedBy = approver.username;
       await updateRequest(cleanRoomId, reqItem);
 
-      // Notify requester: "Rejected"
       const requesterParticipant = room.participants.get(reqItem.userId);
       if (requesterParticipant) {
         const reqSocket = io.sockets.sockets.get(requesterParticipant.socketId);
@@ -936,7 +944,6 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
         reqSocket?.emit('request_notification', { message: 'Your video request was rejected.', type: 'info' });
       }
 
-      // Broadcast update to all hosts/moderators
       for (const [_, p] of room.participants.entries()) {
         if (p.role === 'host' || p.role === 'moderator') {
           io.sockets.sockets.get(p.socketId)?.emit('request_updated', { request: reqItem });
@@ -962,7 +969,6 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     const callerRole = await getRole(cleanRoomId, caller.userId);
     if (callerRole !== 'host' && callerRole !== 'moderator') return;
 
-    // Verify videoId matches current video
     if (videoId && videoId !== room.videoId) return;
 
     try {
@@ -988,7 +994,6 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     }
   });
 
-  // Explicit leave: immediate removal
   const handleExplicitLeave = () => {
     const room = roomManager.getRoomBySocketId(socket.id);
     if (!room) return;
@@ -1017,6 +1022,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     if (room.participants.size === 0) {
       roomManager.removeRoom(room.id);
+      removeRoomHost(room.id).catch(() => {});
     } else {
       io.to(room.id).emit('user_left', {
         userId: participant.userId,
@@ -1028,6 +1034,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       const currentHost = room.getParticipant(room.hostUserId || room.hostSocketId);
       if (currentHost) {
         assignRole(room.id, currentHost.userId, 'host').catch(() => {});
+        setRoomHost(room.id, currentHost.userId).catch(() => {});
         io.to(room.id).emit('role_assigned', {
           userId: currentHost.userId,
           username: currentHost.username,
@@ -1055,6 +1062,11 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     const roomId = room.id;
     const userId = participant.userId;
+    socket.to(roomId).emit('user_typing', {
+      userId,
+      username: participant.username,
+      isTyping: false,
+    });
     const disconnectKey = `${roomId}:${userId}`;
 
     if (pendingDisconnects.has(disconnectKey)) {
@@ -1093,6 +1105,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
           const currentHost = room.getParticipant(room.hostUserId || room.hostSocketId);
           if (currentHost) {
             assignRole(roomId, currentHost.userId, 'host').catch(() => {});
+            setRoomHost(roomId, currentHost.userId).catch(() => {});
             io.to(roomId).emit('role_assigned', {
               userId: currentHost.userId,
               username: currentHost.username,

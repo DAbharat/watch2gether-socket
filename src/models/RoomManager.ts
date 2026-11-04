@@ -8,8 +8,15 @@ export class RoomManager {
     this.rooms = new Map();
   }
 
-  createRoom(roomId: string, hostSocketId: string, hostUsername: string, hostUserId?: string): Room {
-    const room = new Room(roomId, hostSocketId, hostUsername, hostUserId);
+  createRoom(
+    roomId: string,
+    socketId: string,
+    username: string,
+    userId?: string,
+    role: Role = 'participant',
+    designatedHostUserId?: string
+  ): Room {
+    const room = new Room(roomId, socketId, username, userId, role, designatedHostUserId);
     this.rooms.set(roomId, room);
     return room;
   }
@@ -23,11 +30,12 @@ export class RoomManager {
     socketId: string,
     username: string,
     userId?: string,
-    role: Role = 'participant'
+    role: Role = 'participant',
+    designatedHostUserId?: string
   ): { room: Room; isNewRoom: boolean } {
     let room = this.rooms.get(roomId);
     if (!room) {
-      room = this.createRoom(roomId, socketId, username, userId);
+      room = this.createRoom(roomId, socketId, username, userId, role, designatedHostUserId);
       return { room, isNewRoom: true };
     } else {
       room.addOrUpdateParticipant(userId || socketId, socketId, username, role);

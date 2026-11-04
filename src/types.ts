@@ -45,7 +45,9 @@ export interface UserJoinedPayload {
   username: string;
   userId: string;
   role: Role;
-  participants: ParticipantData[];
+  participant?: ParticipantData;
+  participants?: ParticipantData[];
+  joinedAt: number;
 }
 
 export interface UserLeftPayload {
@@ -117,6 +119,8 @@ export interface ClientToServerEvents {
   chat_message: (data: { roomId: string; text: string }) => void;
   send_reaction: (data: { roomId: string; emoji: string }) => void;
   reaction: (data: { roomId: string; emoji: string }) => void;
+  typing_start: (data: { roomId: string }) => void;
+  typing_stop: (data: { roomId: string }) => void;
   request_video: (data: { roomId: string; participantToken: string; videoUrl: string }) => void;
   resolve_request: (data: { roomId: string; participantToken: string; requestId: string; action: 'play_now' | 'queue' | 'reject' }) => void;
   video_ended: (data: { roomId: string; videoId: string; participantToken?: string }) => void;
@@ -128,6 +132,7 @@ export interface ServerToClientEvents {
   ntp_pong: (data: { clientSendTime: number; serverTime: number }) => void;
   user_joined: (data: UserJoinedPayload) => void;
   user_left: (data: UserLeftPayload) => void;
+  user_typing: (data: { userId: string; username: string; isTyping: boolean }) => void;
   play: (data: { currentTime: number; anchorPosition?: number; anchorServerTime?: number; sentAt?: number }) => void;
   pause: (data: { currentTime: number; anchorPosition?: number; anchorServerTime?: number; sentAt?: number }) => void;
   seek: (data: { time: number; anchorPosition?: number; anchorServerTime?: number; sentAt?: number }) => void;

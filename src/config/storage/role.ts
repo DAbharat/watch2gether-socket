@@ -42,4 +42,26 @@ export async function removeParticipant(
   return await redis.hdel(key, participantId);
 }
 
+export async function setRoomHost(
+  roomId: string,
+  hostUserId: string
+): Promise<void> {
+  const key = `room:${roomId}:host`;
+  await redis.set(key, hostUserId, "EX", ROOM_TTL);
+}
+
+export async function getRoomHost(
+  roomId: string
+): Promise<string | null> {
+  const key = `room:${roomId}:host`;
+  return await redis.get(key);
+}
+
+export async function removeRoomHost(
+  roomId: string
+): Promise<number> {
+  const key = `room:${roomId}:host`;
+  return await redis.del(key);
+}
+
 export const removeParticipantRole = removeParticipant;

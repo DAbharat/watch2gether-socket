@@ -25,10 +25,17 @@ export class Room {
   pendingRequests: Map<string, ActionRequest>;
   joinCounter: number = 0;
 
-  constructor(id: string, hostSocketId: string, hostUsername: string, hostUserId?: string) {
+  constructor(
+    id: string,
+    socketId: string,
+    username: string,
+    userId?: string,
+    role: Role = 'participant',
+    designatedHostUserId?: string
+  ) {
     this.id = id;
-    this.hostSocketId = hostSocketId;
-    this.hostUserId = hostUserId || hostSocketId;
+    this.hostSocketId = role === 'host' ? socketId : '';
+    this.hostUserId = designatedHostUserId || (role === 'host' ? (userId || socketId) : '');
     this.videoId = 'dQw4w9WgXcQ';
     this.currentTime = 0;
     this.isPlaying = false;
@@ -40,7 +47,7 @@ export class Room {
     this.messages = [];
     this.pendingRequests = new Map();
 
-    this.addOrUpdateParticipant(this.hostUserId, hostSocketId, hostUsername, 'host');
+    this.addOrUpdateParticipant(userId || socketId, socketId, username, role);
   }
 
   addOrUpdateParticipant(
