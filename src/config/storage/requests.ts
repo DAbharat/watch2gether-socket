@@ -22,9 +22,6 @@ export interface QueueItem {
   approvedAt: number;
 }
 
-/**
- * Save a new video request in the room's requests hash
- */
 export async function saveRequest(roomId: string, request: VideoRequest): Promise<void> {
   const key = `room:${roomId}:requests`;
   await redis
@@ -34,9 +31,6 @@ export async function saveRequest(roomId: string, request: VideoRequest): Promis
     .exec();
 }
 
-/**
- * Get a specific request by ID
- */
 export async function getRequest(roomId: string, requestId: string): Promise<VideoRequest | null> {
   const key = `room:${roomId}:requests`;
   const raw = await redis.hget(key, requestId);
@@ -55,9 +49,6 @@ export async function getRequest(roomId: string, requestId: string): Promise<Vid
   }
 }
 
-/**
- * Update an existing request
- */
 export async function updateRequest(roomId: string, request: VideoRequest): Promise<void> {
   const key = `room:${roomId}:requests`;
   await redis
@@ -67,9 +58,6 @@ export async function updateRequest(roomId: string, request: VideoRequest): Prom
     .exec();
 }
 
-/**
- * Get all requests for a room, auto-expiring pending requests older than 10 minutes
- */
 export async function getAllRequests(roomId: string): Promise<VideoRequest[]> {
   const key = `room:${roomId}:requests`;
   const rawAll = await redis.hgetall(key);
@@ -97,29 +85,19 @@ export async function getAllRequests(roomId: string): Promise<VideoRequest[]> {
     await redis.hset(key, toUpdate);
   }
 
-  // Sort by createdAt descending
   return requests.sort((a, b) => b.createdAt - a.createdAt);
 }
 
-/**
- * Get requests for a specific user
- */
 export async function getUserRequests(roomId: string, userId: string): Promise<VideoRequest[]> {
   const all = await getAllRequests(roomId);
   return all.filter((r) => r.userId === userId);
 }
 
-/**
- * Count active pending requests for a user in this room
- */
 export async function getUserPendingCount(roomId: string, userId: string): Promise<number> {
   const all = await getAllRequests(roomId);
   return all.filter((r) => r.userId === userId && r.status === 'pending').length;
 }
 
-/**
- * Remove a participant's pending requests when they leave the room
- */
 export async function removeUserPendingRequests(roomId: string, userId: string): Promise<string[]> {
   const key = `room:${roomId}:requests`;
   const rawAll = await redis.hgetall(key);
@@ -144,9 +122,6 @@ export async function removeUserPendingRequests(roomId: string, userId: string):
   return droppedIds;
 }
 
-/**
- * Rate limit check: max 5 requests per participant per 60 seconds
- */
 export async function checkRateLimit(roomId: string, userId: string): Promise<boolean> {
   const key = `room:${roomId}:ratelimit:${userId}`;
   const count = await redis.incr(key);
@@ -156,16 +131,13 @@ export async function checkRateLimit(roomId: string, userId: string): Promise<bo
   return count <= 5;
 }
 
-/**
- * Check if video is already pending or in the room queue
- */
 export async function checkDuplicate(roomId: string, videoId: string): Promise<boolean> {
-  // 1. Check pending requests
+  // Check pending requests
   const requests = await getAllRequests(roomId);
   const isPending = requests.some((r) => r.status === 'pending' && r.videoId === videoId);
   if (isPending) return true;
 
-  // 2. Check queue
+  // Check queue
   const queue = await getQueue(roomId);
   const isInQueue = queue.some((q) => q.videoId === videoId);
   if (isInQueue) return true;
@@ -173,9 +145,6 @@ export async function checkDuplicate(roomId: string, videoId: string): Promise<b
   return false;
 }
 
-/**
- * Add a video to the room queue (capped at 20 items)
- */
 export async function addToQueue(roomId: string, item: QueueItem): Promise<number> {
   const key = `room:${roomId}:queue`;
   const currentLen = await redis.llen(key);
@@ -191,9 +160,6 @@ export async function addToQueue(roomId: string, item: QueueItem): Promise<numbe
   return newLen;
 }
 
-/**
- * Get all queue items
- */
 export async function getQueue(roomId: string): Promise<QueueItem[]> {
   const key = `room:${roomId}:queue`;
   const rawList = await redis.lrange(key, 0, -1);
@@ -210,9 +176,6 @@ export async function getQueue(roomId: string): Promise<QueueItem[]> {
   return items;
 }
 
-/**
- * Pop the next video from the queue
- */
 export async function popNextQueueItem(roomId: string): Promise<QueueItem | null> {
   const key = `room:${roomId}:queue`;
   const raw = await redis.lpop(key);

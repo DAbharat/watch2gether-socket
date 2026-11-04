@@ -5,7 +5,7 @@
  * from spinning down into sleep mode.
  */
 export function startKeepAlive() {
-  const targetUrl = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL;
+  const targetUrl = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL || process.env.RENDER_URL;
   if (!targetUrl) {
     return;
   }
