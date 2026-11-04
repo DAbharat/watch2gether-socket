@@ -9,11 +9,27 @@ import { ClientToServerEvents, ServerToClientEvents, Role, ActionRequest } from 
 import { assignRole, getRole, getAllParticipantRoles, removeParticipantRole } from './config/storage/role.js';
 import { saveMessages, getMessages } from './config/storage/chat.js';
 import { verifyParticipantToken } from './config/storage/participant/participant.js';
+import {
+  saveRequest,
+  getRequest,
+  getAllRequests,
+  getUserRequests,
+  updateRequest,
+  removeUserPendingRequests,
+  checkRateLimit,
+  checkDuplicate,
+  addToQueue,
+  getQueue,
+  popNextQueueItem,
+  getUserPendingCount,
+  VideoRequest,
+  QueueItem,
+} from './config/storage/requests.js';
+import { validateYouTubeUrl } from './utils/youtubeValidator.js';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Parse allowed frontend origins from CLIENT_URL (supports comma-separated URLs or '*')
 const rawClientUrls = process.env.CLIENT_URL || process.env.FRONTEND_URL || '*';
 const allowedOrigins = rawClientUrls.split(',').map((url) => url.trim().replace(/\/$/, ''));
 
@@ -21,7 +37,6 @@ const isOriginAllowed = (origin: string | undefined): boolean => {
   if (!origin) return true;
   if (allowedOrigins.includes('*')) return true;
   if (allowedOrigins.includes(origin)) return true;
-  // Always permit local development ports (e.g. http://localhost:3000)
   if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
   return false;
 };
@@ -198,6 +213,22 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     if (!participant) return;
 
     socket.emit('sync_state', room.getState());
+
+    // Sync queue and requests on join
+    try {
+      const queue = await getQueue(cleanRoomId);
+      socket.emit('queue_updated', { queue });
+
+      if (participant.role === 'host' || participant.role === 'moderator') {
+        const allReqs = await getAllRequests(cleanRoomId);
+        socket.emit('requests_sync', { requests: allReqs });
+      } else {
+        const userReqs = await getUserRequests(cleanRoomId, participant.userId);
+        socket.emit('requests_sync', { requests: userReqs });
+      }
+    } catch (err: any) {
+      console.error('[Redis] Error loading queue/requests on join:', err.message);
+    }
 
     io.to(cleanRoomId).emit('user_joined', {
       username: participant.username,
@@ -675,6 +706,288 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
   socket.on('send_reaction', handleReaction);
   socket.on('reaction', handleReaction);
 
+  // -------------------------------------------------------------
+  // Video Requests & Queue Handling
+  // -------------------------------------------------------------
+  socket.on('get_requests', async ({ roomId, participantToken }) => {
+    if (!roomId) return;
+    const cleanRoomId = roomId.trim();
+    const room = roomManager.getRoom(cleanRoomId);
+    if (!room) return;
+
+    const participant = room.getParticipant(socket.id);
+    if (!participant) return;
+
+    if (participantToken) {
+      const isValid = await verifyParticipantToken(cleanRoomId, participant.userId, participantToken.trim());
+      if (!isValid) return sendError(socket, 'Unauthorized participant token.');
+    }
+
+    try {
+      const currentRole = await getRole(cleanRoomId, participant.userId);
+      if (currentRole === 'host' || currentRole === 'moderator') {
+        const requests = await getAllRequests(cleanRoomId);
+        socket.emit('requests_sync', { requests });
+      } else {
+        const requests = await getUserRequests(cleanRoomId, participant.userId);
+        socket.emit('requests_sync', { requests });
+      }
+
+      const queue = await getQueue(cleanRoomId);
+      socket.emit('queue_updated', { queue });
+    } catch (err: any) {
+      console.error('[Redis] Error fetching requests:', err.message);
+    }
+  });
+
+  socket.on('request_video', async ({ roomId, participantToken, videoUrl }) => {
+    if (!roomId || !participantToken || !videoUrl) {
+      return sendError(socket, 'Missing required parameters for video request.');
+    }
+
+    const cleanRoomId = roomId.trim();
+    const room = roomManager.getRoom(cleanRoomId);
+    if (!room) return sendError(socket, 'Room not found.');
+
+    const participant = room.getParticipant(socket.id);
+    if (!participant) return sendError(socket, 'You are not in this room.');
+
+    // Verify token from Redis
+    const isTokenValid = await verifyParticipantToken(cleanRoomId, participant.userId, participantToken.trim());
+    if (!isTokenValid) {
+      return sendError(socket, 'Unauthorized participant token.');
+    }
+
+    // Role check from Redis: Only participants submit requests
+    const currentRole = await getRole(cleanRoomId, participant.userId);
+    if (currentRole !== 'participant') {
+      return sendError(socket, 'Host and moderators can change or queue videos directly.');
+    }
+
+    // Server-side URL validation
+    const validation = validateYouTubeUrl(videoUrl);
+    if (!validation.valid || !validation.videoId) {
+      return sendError(socket, validation.error || 'Invalid YouTube URL.');
+    }
+
+    const videoId = validation.videoId;
+
+    // Rate limit: max 5 requests per participant per minute
+    const rateOk = await checkRateLimit(cleanRoomId, participant.userId);
+    if (!rateOk) {
+      return sendError(socket, 'Rate limit exceeded: Max 5 requests per minute.');
+    }
+
+    // Max 3 pending requests per participant
+    const pendingCount = await getUserPendingCount(cleanRoomId, participant.userId);
+    if (pendingCount >= 3) {
+      return sendError(socket, 'You already have 3 pending requests. Please wait for them to be reviewed.');
+    }
+
+    // Duplicates: ignore if same videoId is already pending or in the queue
+    const isDup = await checkDuplicate(cleanRoomId, videoId);
+    if (isDup) {
+      return sendError(socket, 'This video is already requested or in the queue.');
+    }
+
+    // Check queue limit
+    const queue = await getQueue(cleanRoomId);
+    if (queue.length >= 20) {
+      return sendError(socket, 'Queue is currently full (max 20 videos).');
+    }
+
+    const requestId = `req_${Math.random().toString(36).substring(2, 10)}_${Date.now()}`;
+    const newRequest: VideoRequest = {
+      requestId,
+      userId: participant.userId,
+      username: participant.username,
+      videoId,
+      status: 'pending',
+      createdAt: Date.now(),
+    };
+
+    try {
+      await saveRequest(cleanRoomId, newRequest);
+
+      // Notify requester
+      socket.emit('request_created', { request: newRequest });
+      socket.emit('request_notification', { message: 'Video request submitted!', type: 'success' });
+
+      // Send to Host and Moderator sockets only
+      for (const [_, p] of room.participants.entries()) {
+        if (p.role === 'host' || p.role === 'moderator') {
+          const s = io.sockets.sockets.get(p.socketId);
+          if (s && s.id !== socket.id) {
+            s.emit('request_created', { request: newRequest });
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error('[Redis] Error saving video request:', err.message);
+      sendError(socket, 'Failed to save video request. Please try again.');
+    }
+  });
+
+  socket.on('resolve_request', async ({ roomId, participantToken, requestId, action }) => {
+    if (!roomId || !participantToken || !requestId || !action) {
+      return sendError(socket, 'Missing required parameters to resolve request.');
+    }
+
+    const cleanRoomId = roomId.trim();
+    const room = roomManager.getRoom(cleanRoomId);
+    if (!room) return sendError(socket, 'Room not found.');
+
+    const approver = room.getParticipant(socket.id);
+    if (!approver) return sendError(socket, 'You are not in this room.');
+
+    // Verify approver token
+    const isTokenValid = await verifyParticipantToken(cleanRoomId, approver.userId, participantToken.trim());
+    if (!isTokenValid) {
+      return sendError(socket, 'Unauthorized participant token.');
+    }
+
+    // Re-check approver's role from Redis at resolve time
+    const approverRole = await getRole(cleanRoomId, approver.userId);
+    if (approverRole !== 'host' && approverRole !== 'moderator') {
+      return sendError(socket, 'Permission denied: Only Host and Moderators can resolve requests.');
+    }
+
+    const reqItem = await getRequest(cleanRoomId, requestId);
+    if (!reqItem || reqItem.status !== 'pending') {
+      return sendError(socket, 'Request not found or already resolved.');
+    }
+
+    if (action === 'play_now') {
+      reqItem.status = 'accepted';
+      reqItem.action = 'play_now';
+      reqItem.resolvedAt = Date.now();
+      reqItem.resolvedBy = approver.username;
+      await updateRequest(cleanRoomId, reqItem);
+
+      // Run change_video immediately
+      room.updatePlaybackState({ videoId: reqItem.videoId, currentTime: 0, isPlaying: true });
+      io.to(cleanRoomId).emit('change_video', { videoId: reqItem.videoId });
+      io.to(cleanRoomId).emit('sync_state', room.getState());
+
+      // Notify requester: "Accepted"
+      const requesterParticipant = room.participants.get(reqItem.userId);
+      if (requesterParticipant) {
+        const reqSocket = io.sockets.sockets.get(requesterParticipant.socketId);
+        reqSocket?.emit('request_updated', { request: reqItem, message: 'Accepted' });
+        reqSocket?.emit('request_notification', { message: 'Your video request was accepted and is playing now!', type: 'success' });
+      }
+
+      // Broadcast update to all hosts/moderators
+      for (const [_, p] of room.participants.entries()) {
+        if (p.role === 'host' || p.role === 'moderator') {
+          io.sockets.sockets.get(p.socketId)?.emit('request_updated', { request: reqItem });
+        }
+      }
+    } else if (action === 'queue') {
+      const currentQueue = await getQueue(cleanRoomId);
+      if (currentQueue.length >= 20) {
+        return sendError(socket, 'Queue is full (maximum 20 videos).');
+      }
+
+      const queueItem: QueueItem = {
+        videoId: reqItem.videoId,
+        requestedBy: reqItem.userId,
+        requestedByUsername: reqItem.username,
+        approvedAt: Date.now(),
+      };
+
+      await addToQueue(cleanRoomId, queueItem);
+
+      reqItem.status = 'accepted';
+      reqItem.action = 'queue';
+      reqItem.resolvedAt = Date.now();
+      reqItem.resolvedBy = approver.username;
+      await updateRequest(cleanRoomId, reqItem);
+
+      const updatedQueue = await getQueue(cleanRoomId);
+      io.to(cleanRoomId).emit('queue_updated', { queue: updatedQueue });
+
+      // Notify requester: "Added to queue"
+      const requesterParticipant = room.participants.get(reqItem.userId);
+      if (requesterParticipant) {
+        const reqSocket = io.sockets.sockets.get(requesterParticipant.socketId);
+        reqSocket?.emit('request_updated', { request: reqItem, message: 'Added to queue' });
+        reqSocket?.emit('request_notification', { message: 'Your video request was added to the queue!', type: 'success' });
+      }
+
+      // Broadcast update to all hosts/moderators
+      for (const [_, p] of room.participants.entries()) {
+        if (p.role === 'host' || p.role === 'moderator') {
+          io.sockets.sockets.get(p.socketId)?.emit('request_updated', { request: reqItem });
+        }
+      }
+    } else if (action === 'reject') {
+      reqItem.status = 'rejected';
+      reqItem.action = 'reject';
+      reqItem.resolvedAt = Date.now();
+      reqItem.resolvedBy = approver.username;
+      await updateRequest(cleanRoomId, reqItem);
+
+      // Notify requester: "Rejected"
+      const requesterParticipant = room.participants.get(reqItem.userId);
+      if (requesterParticipant) {
+        const reqSocket = io.sockets.sockets.get(requesterParticipant.socketId);
+        reqSocket?.emit('request_updated', { request: reqItem, message: 'Rejected' });
+        reqSocket?.emit('request_notification', { message: 'Your video request was rejected.', type: 'info' });
+      }
+
+      // Broadcast update to all hosts/moderators
+      for (const [_, p] of room.participants.entries()) {
+        if (p.role === 'host' || p.role === 'moderator') {
+          io.sockets.sockets.get(p.socketId)?.emit('request_updated', { request: reqItem });
+        }
+      }
+    }
+  });
+
+  socket.on('video_ended', async ({ roomId, videoId, participantToken }) => {
+    if (!roomId) return;
+    const cleanRoomId = roomId.trim();
+    const room = roomManager.getRoom(cleanRoomId);
+    if (!room) return;
+
+    const caller = room.getParticipant(socket.id);
+    if (!caller) return;
+
+    if (participantToken) {
+      const isTokenValid = await verifyParticipantToken(cleanRoomId, caller.userId, participantToken.trim());
+      if (!isTokenValid) return;
+    }
+
+    const callerRole = await getRole(cleanRoomId, caller.userId);
+    if (callerRole !== 'host' && callerRole !== 'moderator') return;
+
+    // Verify videoId matches current video
+    if (videoId && videoId !== room.videoId) return;
+
+    try {
+      const nextItem = await popNextQueueItem(cleanRoomId);
+      if (nextItem) {
+        room.updatePlaybackState({ videoId: nextItem.videoId, currentTime: 0, isPlaying: true });
+        io.to(cleanRoomId).emit('change_video', { videoId: nextItem.videoId });
+        const updatedQueue = await getQueue(cleanRoomId);
+        io.to(cleanRoomId).emit('queue_updated', { queue: updatedQueue });
+        io.to(cleanRoomId).emit('sync_state', room.getState());
+      } else {
+        room.updatePlaybackState({ isPlaying: false, currentTime: room.currentTime });
+        io.to(cleanRoomId).emit('pause', {
+          currentTime: room.currentTime,
+          anchorPosition: room.anchorPosition,
+          anchorServerTime: room.anchorServerTime,
+          sentAt: Date.now(),
+        });
+        io.to(cleanRoomId).emit('sync_state', room.getState());
+      }
+    } catch (err: any) {
+      console.error('[Redis] Error advancing queue:', err.message);
+    }
+  });
+
   // Explicit leave: immediate removal
   const handleExplicitLeave = () => {
     const room = roomManager.getRoomBySocketId(socket.id);
@@ -691,6 +1004,16 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     room.removeParticipant(participant.userId);
     removeParticipantRole(room.id, participant.userId).catch(() => {});
+    removeUserPendingRequests(room.id, participant.userId).then(async (droppedIds) => {
+      if (droppedIds.length > 0) {
+        const refreshed = await getAllRequests(room.id);
+        for (const [_, p] of room.participants.entries()) {
+          if (p.role === 'host' || p.role === 'moderator') {
+            io.sockets.sockets.get(p.socketId)?.emit('requests_sync', { requests: refreshed });
+          }
+        }
+      }
+    }).catch(() => {});
 
     if (room.participants.size === 0) {
       roomManager.removeRoom(room.id);
@@ -746,6 +1069,16 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       if (currentParticipant && currentParticipant.socketId === socket.id) {
         room.removeParticipant(userId);
         removeParticipantRole(roomId, userId).catch(() => {});
+        removeUserPendingRequests(roomId, userId).then(async (droppedIds) => {
+          if (droppedIds.length > 0) {
+            const refreshed = await getAllRequests(roomId);
+            for (const [_, p] of room.participants.entries()) {
+              if (p.role === 'host' || p.role === 'moderator') {
+                io.sockets.sockets.get(p.socketId)?.emit('requests_sync', { requests: refreshed });
+              }
+            }
+          }
+        }).catch(() => {});
 
         if (room.participants.size === 0) {
           roomManager.removeRoom(roomId);

@@ -78,6 +78,25 @@ export interface ErrorMessagePayload {
   message: string;
 }
 
+export interface VideoRequest {
+  requestId: string;
+  userId: string;
+  username: string;
+  videoId: string;
+  status: 'pending' | 'accepted' | 'rejected';
+  createdAt: number;
+  action?: 'play_now' | 'queue' | 'reject';
+  resolvedAt?: number;
+  resolvedBy?: string;
+}
+
+export interface QueueItem {
+  videoId: string;
+  requestedBy: string;
+  requestedByUsername: string;
+  approvedAt: number;
+}
+
 export interface ClientToServerEvents {
   join_room: (data: { roomId: string; username: string; participantId?: string; participantToken?: string }) => void;
   leave_room: () => void;
@@ -98,6 +117,10 @@ export interface ClientToServerEvents {
   chat_message: (data: { roomId: string; text: string }) => void;
   send_reaction: (data: { roomId: string; emoji: string }) => void;
   reaction: (data: { roomId: string; emoji: string }) => void;
+  request_video: (data: { roomId: string; participantToken: string; videoUrl: string }) => void;
+  resolve_request: (data: { roomId: string; participantToken: string; requestId: string; action: 'play_now' | 'queue' | 'reject' }) => void;
+  video_ended: (data: { roomId: string; videoId: string; participantToken?: string }) => void;
+  get_requests: (data: { roomId: string; participantToken: string }) => void;
 }
 
 export interface ServerToClientEvents {
@@ -125,4 +148,9 @@ export interface ServerToClientEvents {
   action_approved: (data: { requestId: string; type: string }) => void;
   action_denied: (data: { requestId: string; type: string; reason: string }) => void;
   action_resolved: (data: { requestId: string }) => void;
+  request_created: (data: { request: VideoRequest }) => void;
+  request_updated: (data: { request: VideoRequest; message?: string }) => void;
+  requests_sync: (data: { requests: VideoRequest[] }) => void;
+  queue_updated: (data: { queue: QueueItem[] }) => void;
+  request_notification: (data: { message: string; type: 'info' | 'success' | 'warning' | 'error' }) => void;
 }
