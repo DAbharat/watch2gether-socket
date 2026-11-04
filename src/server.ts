@@ -26,6 +26,7 @@ import {
   QueueItem,
 } from './config/storage/requests.js';
 import { validateYouTubeUrl } from './utils/youtubeValidator.js';
+import { startKeepAlive } from './utils/keepAlive.js';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -1133,4 +1134,5 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
 server.listen(PORT, () => {
   console.log(`>>> Watch2Gether server running on port ${PORT}`);
+  startKeepAlive();
 });

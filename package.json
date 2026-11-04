@@ -7,7 +7,8 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "tsx src/server.ts",
-    "start:dist": "node dist/server.js"
+    "start:dist": "node dist/server.js",
+    "keepalive": "node scripts/keepalive.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

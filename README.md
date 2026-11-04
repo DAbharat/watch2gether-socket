@@ -161,20 +161,20 @@ sequenceDiagram
     Server-->>Room: Retain Participant in Map temporarily
 
     alt User Reconnects within 8 Seconds
-        Socket->>Server: join_room { roomId, userId, participantToken }
+        Socket->>Server: join_room (roomId, userId, participantToken)
         Server->>Server: Verify Cryptographic Token
         Server->>Timer: Cancel Staged Timer
         Server->>Room: Bind New Socket ID to Existing Participant
         Server-->>Socket: sync_state (Session Restored)
-        Note over Server: Zero room disturbance; role and host intact
+        Note over Server: Session restored without room disturbance
     else 8 Seconds Expire
         Timer->>Room: Evict Participant (removeParticipant)
-        Timer-.->Redis: Delete Role & Pending Requests asynchronously
-        Timer-->>Server: Broadcast 'user_left' { userId }
+        Timer-.->Redis: Delete Role and Pending Requests asynchronously
+        Timer-->>Server: Broadcast user_left (userId)
         opt Evicted Participant Was Room Host
             Timer->>Room: Elect Oldest Remaining Participant to Host
             Timer-.->Redis: Persist New Host Record
-            Timer-->>Server: Broadcast 'role_assigned' & 'role_changed'
+            Timer-->>Server: Broadcast role_assigned and role_changed
         end
     end
 ```
@@ -563,6 +563,10 @@ MAX_MESSAGES=150
 
 # Chat retention Time-To-Live in seconds (Default: 24 Hours)
 CHAT_TTL=86400
+
+# Keep-Alive Self-Ping Configuration (Prevents Render Free Tier from sleeping)
+KEEP_ALIVE_URL=https://your-socket-server.onrender.com
+KEEP_ALIVE_INTERVAL_MINS=10
 ```
 
 ---
