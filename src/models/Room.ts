@@ -17,6 +17,8 @@ export class Room {
   currentTime: number;
   isPlaying: boolean;
   lastUpdated: number;
+  anchorPosition: number;
+  anchorServerTime: number;
   participants: Map<string, Participant>; // Keyed by stable userId
   socketToUserId: Map<string, string>;   // Maps socketId -> userId
   messages: ChatMessage[];
@@ -31,6 +33,8 @@ export class Room {
     this.currentTime = 0;
     this.isPlaying = false;
     this.lastUpdated = Date.now();
+    this.anchorPosition = 0;
+    this.anchorServerTime = this.lastUpdated;
     this.participants = new Map();
     this.socketToUserId = new Map();
     this.messages = [];
@@ -69,6 +73,12 @@ export class Room {
     this.joinCounter++;
     const avatar = SHADCN_AVATARS[avatarIndex];
 
+    // Single-host invariant: A room can only have one active host
+    const activeHost = this.hostUserId ? this.participants.get(this.hostUserId) : undefined;
+    if (role === 'host' && activeHost && activeHost.userId !== userId) {
+      role = 'participant';
+    }
+
     const participant = new Participant(userId, socketId, username, role, avatar);
     this.participants.set(userId, participant);
     this.socketToUserId.set(socketId, userId);
@@ -96,10 +106,10 @@ export class Room {
     }
 
     // Auto-promote: If host left/disconnected, promote a Moderator first, else first participant
-    if (
-      (this.hostUserId === participant.userId || this.hostSocketId === participant.socketId) &&
-      this.participants.size > 0
-    ) {
+    if (this.participants.size === 0) {
+      this.hostUserId = '';
+      this.hostSocketId = '';
+    } else if (this.hostUserId === participant.userId || this.hostSocketId === participant.socketId) {
       const participantsList = Array.from(this.participants.values());
       const nextHost = participantsList.find((p) => p.role === 'moderator') || participantsList[0];
       if (nextHost) {
@@ -175,16 +185,33 @@ export class Room {
     currentTime?: number;
     videoId?: string;
   }): void {
-    if (typeof isPlaying === 'boolean') this.isPlaying = isPlaying;
-    if (typeof currentTime === 'number') this.currentTime = currentTime;
-    if (typeof videoId === 'string' && videoId.trim()) this.videoId = videoId.trim();
-    this.lastUpdated = Date.now();
+    const now = Date.now();
+    if (typeof videoId === 'string' && videoId.trim()) {
+      this.videoId = videoId.trim();
+      this.anchorPosition = 0;
+      this.currentTime = 0;
+      this.isPlaying = true;
+      this.anchorServerTime = now;
+      this.lastUpdated = now;
+      return;
+    }
+
+    const newPlaying = typeof isPlaying === 'boolean' ? isPlaying : this.isPlaying;
+    const newTime = typeof currentTime === 'number' && !isNaN(currentTime)
+      ? currentTime
+      : this.getCalculatedCurrentTime();
+
+    this.currentTime = newTime;
+    this.anchorPosition = newTime;
+    this.isPlaying = newPlaying;
+    this.anchorServerTime = now;
+    this.lastUpdated = now;
   }
 
   getCalculatedCurrentTime(): number {
     if (this.isPlaying) {
-      const elapsedSec = (Date.now() - this.lastUpdated) / 1000;
-      return this.currentTime + elapsedSec;
+      const elapsedSec = (Date.now() - this.anchorServerTime) / 1000;
+      return Math.max(0, this.anchorPosition + elapsedSec);
     }
     return this.currentTime;
   }
@@ -203,6 +230,8 @@ export class Room {
       hostSocketId: this.hostSocketId,
       participants: this.getParticipantList(),
       messages: this.messages,
+      anchorPosition: this.anchorPosition,
+      anchorServerTime: this.anchorServerTime,
     };
   }
 

@@ -92,17 +92,26 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     socket.join(cleanRoomId);
 
+    const existingRoom = roomManager.getRoom(cleanRoomId);
     let role: Role = 'participant';
     try {
+      // Check whether there is an active host currently connected in this room
+      const activeHost = existingRoom && existingRoom.participants.size > 0
+        ? Array.from(existingRoom.participants.values()).find((p) => p.role === 'host')
+        : undefined;
+
       const existingRole = await getRole(cleanRoomId, stableUserId);
 
       if (existingRole && ['host', 'moderator', 'participant'].includes(existingRole)) {
         role = existingRole as Role;
+        // If this user has a stored host role, but another user is already the active host in this room
+        if (role === 'host' && activeHost && activeHost.userId !== stableUserId) {
+          role = 'participant';
+          await assignRole(cleanRoomId, stableUserId, 'participant');
+        }
       } else {
-        const existingRoles = await getAllParticipantRoles(cleanRoomId);
-        const hasHost = Object.values(existingRoles).includes('host');
-
-        if (!hasHost) {
+        // If there is no active host currently connected in the room, the joining user is the host!
+        if (!activeHost) {
           role = 'host';
         } else {
           role = 'participant';
@@ -112,6 +121,10 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       }
     } catch (err: any) {
       console.error('[Redis] Error fetching/assigning role:', err.message);
+      // Fallback: If Redis is unavailable or empty, the first user in the room is host
+      if (!existingRoom || existingRoom.participants.size === 0) {
+        role = 'host';
+      }
     }
 
     const { room } = roomManager.getOrCreateRoom(
@@ -121,6 +134,21 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       stableUserId,
       role
     );
+
+    const currentActiveHost = Array.from(room.participants.values()).find((p) => p.role === 'host');
+    if (!currentActiveHost || room.participants.size === 1) {
+      const p = room.getParticipant(stableUserId);
+      if (p) {
+        p.role = 'host';
+        room.hostUserId = p.userId;
+        room.hostSocketId = p.socketId;
+        try {
+          await assignRole(cleanRoomId, p.userId, 'host');
+        } catch (err: any) {
+          console.error("Assign role error: ", err)
+        }
+      }
+    }
 
     if (room.messages.length === 0) {
       try {
@@ -146,6 +174,13 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     });
   });
 
+  socket.on('ntp_ping', ({ clientSendTime }: { clientSendTime: number }) => {
+    socket.emit('ntp_pong', {
+      clientSendTime,
+      serverTime: Date.now(),
+    });
+  });
+
   socket.on('play', ({ roomId, currentTime }) => {
     const room = roomManager.getRoom(roomId);
     if (!room) return;
@@ -154,8 +189,16 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return sendError(socket, 'Permission denied: Only Host and Moderators can control playback.');
     }
 
-    room.updatePlaybackState({ isPlaying: true, currentTime });
-    socket.to(roomId).emit('play', { currentTime: room.currentTime });
+    const validTime = typeof currentTime === 'number' && !isNaN(currentTime) ? currentTime : room.currentTime;
+    room.updatePlaybackState({ isPlaying: true, currentTime: validTime });
+
+    const sentAt = Date.now();
+    socket.to(roomId).emit('play', {
+      currentTime: validTime,
+      anchorPosition: room.anchorPosition,
+      anchorServerTime: room.anchorServerTime,
+      sentAt
+    });
     io.to(roomId).emit('sync_state', room.getState());
   });
 
@@ -167,8 +210,16 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return sendError(socket, 'Permission denied: Only Host and Moderators can pause playback.');
     }
 
-    room.updatePlaybackState({ isPlaying: false, currentTime });
-    socket.to(roomId).emit('pause', { currentTime: room.currentTime });
+    const validTime = typeof currentTime === 'number' && !isNaN(currentTime) ? currentTime : room.currentTime;
+    room.updatePlaybackState({ isPlaying: false, currentTime: validTime });
+
+    const sentAt = Date.now();
+    socket.to(roomId).emit('pause', {
+      currentTime: validTime,
+      anchorPosition: room.anchorPosition,
+      anchorServerTime: room.anchorServerTime,
+      sentAt
+    });
     io.to(roomId).emit('sync_state', room.getState());
   });
 
@@ -180,9 +231,38 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return sendError(socket, 'Permission denied: Only Host and Moderators can seek.');
     }
 
-    room.updatePlaybackState({ currentTime: time });
-    socket.to(roomId).emit('seek', { time });
+    const validTime = typeof time === 'number' && !isNaN(time) ? time : 0;
+    room.updatePlaybackState({ currentTime: validTime });
+
+    const sentAt = Date.now();
+    socket.to(roomId).emit('seek', {
+      time: validTime,
+      anchorPosition: room.anchorPosition,
+      anchorServerTime: room.anchorServerTime,
+      sentAt
+    });
     io.to(roomId).emit('sync_state', room.getState());
+  });
+
+  socket.on('playback_heartbeat', ({ roomId, currentTime, isPlaying }) => {
+    const room = roomManager.getRoom(roomId);
+    if (!room) return;
+
+    if (!hasPermission(room, socket.id, 'play')) return;
+
+    const validTime = typeof currentTime === 'number' && !isNaN(currentTime) ? currentTime : room.currentTime;
+    room.updatePlaybackState({
+      currentTime: validTime,
+      isPlaying: typeof isPlaying === 'boolean' ? isPlaying : room.isPlaying
+    });
+
+    socket.to(roomId).emit('playback_sync', {
+      currentTime: validTime,
+      isPlaying: room.isPlaying,
+      anchorPosition: room.anchorPosition,
+      anchorServerTime: room.anchorServerTime,
+      sentAt: Date.now()
+    });
   });
 
   socket.on('change_video', ({ roomId, videoId }) => {
@@ -365,17 +445,32 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     if (room.canControl(socket.id)) {
       if (type === 'play') {
         room.updatePlaybackState({ isPlaying: true, currentTime: payload?.currentTime });
-        io.to(roomId).emit('play', { currentTime: room.currentTime });
+        io.to(roomId).emit('play', {
+          currentTime: room.currentTime,
+          anchorPosition: room.anchorPosition,
+          anchorServerTime: room.anchorServerTime,
+          sentAt: Date.now()
+        });
         return io.to(roomId).emit('sync_state', room.getState());
       }
       if (type === 'pause') {
         room.updatePlaybackState({ isPlaying: false, currentTime: payload?.currentTime });
-        io.to(roomId).emit('pause', { currentTime: room.currentTime });
+        io.to(roomId).emit('pause', {
+          currentTime: room.currentTime,
+          anchorPosition: room.anchorPosition,
+          anchorServerTime: room.anchorServerTime,
+          sentAt: Date.now()
+        });
         return io.to(roomId).emit('sync_state', room.getState());
       }
       if (type === 'seek') {
         room.updatePlaybackState({ currentTime: payload?.time });
-        io.to(roomId).emit('seek', { time: payload?.time });
+        io.to(roomId).emit('seek', {
+          time: payload?.time,
+          anchorPosition: room.anchorPosition,
+          anchorServerTime: room.anchorServerTime,
+          sentAt: Date.now()
+        });
         return io.to(roomId).emit('sync_state', room.getState());
       }
       if (type === 'change_video') {
@@ -432,7 +527,10 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       });
 
       io.to(roomId).emit('play', { 
-        currentTime: room.currentTime 
+        currentTime: room.currentTime,
+        anchorPosition: room.anchorPosition,
+        anchorServerTime: room.anchorServerTime,
+        sentAt: Date.now()
       });
       io.to(roomId).emit('sync_state', room.getState());
 
@@ -443,7 +541,10 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       });
 
       io.to(roomId).emit('pause', { 
-        currentTime: room.currentTime 
+        currentTime: room.currentTime,
+        anchorPosition: room.anchorPosition,
+        anchorServerTime: room.anchorServerTime,
+        sentAt: Date.now()
       });
       io.to(roomId).emit('sync_state', room.getState());
 
@@ -453,7 +554,10 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       });
 
       io.to(roomId).emit('seek', { 
-        time: actionReq.payload?.time 
+        time: actionReq.payload?.time,
+        anchorPosition: room.anchorPosition,
+        anchorServerTime: room.anchorServerTime,
+        sentAt: Date.now()
       });
       io.to(roomId).emit('sync_state', room.getState());
     } else if (actionReq.type === 'change_video') {
@@ -553,6 +657,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     }
 
     room.removeParticipant(participant.userId);
+    removeParticipantRole(room.id, participant.userId).catch(() => {});
 
     if (room.participants.size === 0) {
       roomManager.removeRoom(room.id);
@@ -566,6 +671,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
       const currentHost = room.getParticipant(room.hostUserId || room.hostSocketId);
       if (currentHost) {
+        assignRole(room.id, currentHost.userId, 'host').catch(() => {});
         io.to(room.id).emit('role_assigned', {
           userId: currentHost.userId,
           username: currentHost.username,
@@ -606,6 +712,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       // If participant still has the disconnected socketId, they haven't reconnected
       if (currentParticipant && currentParticipant.socketId === socket.id) {
         room.removeParticipant(userId);
+        removeParticipantRole(roomId, userId).catch(() => {});
 
         if (room.participants.size === 0) {
           roomManager.removeRoom(roomId);
@@ -619,6 +726,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
           const currentHost = room.getParticipant(room.hostUserId || room.hostSocketId);
           if (currentHost) {
+            assignRole(roomId, currentHost.userId, 'host').catch(() => {});
             io.to(roomId).emit('role_assigned', {
               userId: currentHost.userId,
               username: currentHost.username,

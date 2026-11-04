@@ -18,6 +18,8 @@ export interface RoomState {
   hostSocketId: string;
   participants: ParticipantData[];
   messages?: ChatMessage[];
+  anchorPosition?: number;
+  anchorServerTime?: number;
 }
 
 export interface ChatMessage {
@@ -79,9 +81,11 @@ export interface ErrorMessagePayload {
 export interface ClientToServerEvents {
   join_room: (data: { roomId: string; username: string; participantId?: string; participantToken?: string }) => void;
   leave_room: () => void;
-  play: (data: { roomId: string; currentTime: number }) => void;
-  pause: (data: { roomId: string; currentTime: number }) => void;
+  ntp_ping: (data: { clientSendTime: number }) => void;
+  play: (data: { roomId: string; currentTime: number; timestamp?: number }) => void;
+  pause: (data: { roomId: string; currentTime: number; timestamp?: number }) => void;
   seek: (data: { roomId: string; time: number }) => void;
+  playback_heartbeat: (data: { roomId: string; currentTime: number; isPlaying: boolean; timestamp?: number }) => void;
   change_video: (data: { roomId: string; videoId: string }) => void;
   assign_role: (data: { roomId: string; userId?: string; targetSocketId?: string; role?: Role; newRole?: Role }) => void;
   remove_participant: (data: { roomId: string; userId?: string; targetSocketId?: string }) => void;
@@ -98,11 +102,13 @@ export interface ClientToServerEvents {
 
 export interface ServerToClientEvents {
   sync_state: (state: RoomState) => void;
+  ntp_pong: (data: { clientSendTime: number; serverTime: number }) => void;
   user_joined: (data: UserJoinedPayload) => void;
   user_left: (data: UserLeftPayload) => void;
-  play: (data: { currentTime: number }) => void;
-  pause: (data: { currentTime: number }) => void;
-  seek: (data: { time: number }) => void;
+  play: (data: { currentTime: number; anchorPosition?: number; anchorServerTime?: number; sentAt?: number }) => void;
+  pause: (data: { currentTime: number; anchorPosition?: number; anchorServerTime?: number; sentAt?: number }) => void;
+  seek: (data: { time: number; anchorPosition?: number; anchorServerTime?: number; sentAt?: number }) => void;
+  playback_sync: (data: { currentTime: number; isPlaying: boolean; anchorPosition?: number; anchorServerTime?: number; sentAt?: number }) => void;
   change_video: (data: { videoId: string }) => void;
   role_assigned: (data: RoleAssignedPayload) => void;
   role_changed: (data: { socketId: string; newRole: Role; hostSocketId: string }) => void;
