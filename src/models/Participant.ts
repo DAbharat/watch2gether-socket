@@ -9,12 +9,13 @@ export class Participant implements ParticipantData {
   avatar: string;
 
   constructor(
+    userId: string,
     socketId: string,
     username: string,
     role: Role = 'participant',
     avatar: string = '/avatars/01.png'
   ) {
-    this.userId = socketId;
+    this.userId = userId || socketId;
     this.socketId = socketId;
     this.username = username || 'Guest';
     this.role = role;

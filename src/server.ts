@@ -2,12 +2,13 @@ import express from 'express';
 import http from 'node:http';
 import { Server, Socket } from 'socket.io';
 import cors from 'cors';
-import dotenv from 'dotenv';
+import 'dotenv/config';
 import { roomManager } from './models/RoomManager.js';
 import { Room } from './models/Room.js';
 import { ClientToServerEvents, ServerToClientEvents, Role, ActionRequest } from './types.js';
-
-dotenv.config();
+import { assignRole, getRole, getAllParticipantRoles, removeParticipantRole } from './config/storage/role.js';
+import { saveMessages, getMessages } from './config/storage/chat.js';
+import { verifyParticipantToken } from './config/storage/participant/participant.js';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -47,8 +48,8 @@ const PERMISSIONS: Record<string, Role[]> = {
   transfer_host: ['host'],
 };
 
-function hasPermission(room: Room, socketId: string, action: string): boolean {
-  const participant = room.getParticipant(socketId);
+function hasPermission(room: Room, socketIdOrUserId: string, action: string): boolean {
+  const participant = room.getParticipant(socketIdOrUserId);
   if (!participant) return false;
   const allowedRoles = PERMISSIONS[action];
   return allowedRoles ? allowedRoles.includes(participant.role) : false;
@@ -59,18 +60,80 @@ function sendError(socket: Socket<any, any>, message: string) {
   socket.emit('error', { message });
 }
 
+// Grace period tracker: key = `${roomId}:${userId}` -> NodeJS.Timeout
+const pendingDisconnects = new Map<string, NodeJS.Timeout>();
+
 io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
   console.log(`[Connected] Socket ID: ${socket.id}`);
 
-  socket.on('join_room', ({ roomId, username }) => {
+  socket.on('join_room', async ({ roomId, username, participantId, participantToken }) => {
     if (!roomId) return;
     const cleanRoomId = roomId.trim();
     const cleanUsername = (username || 'Guest').trim();
 
+    let stableUserId = (participantId || '').trim();
+    if (!stableUserId) {
+      stableUserId = `usr_${Math.random().toString(36).substring(2, 11)}`;
+    }
+
+    if (participantToken) {
+      const isTokenValid = await verifyParticipantToken(cleanRoomId, stableUserId, participantToken.trim());
+      if (!isTokenValid) {
+        console.warn(`[Security] Unauthorized participant token for ${stableUserId} in room ${cleanRoomId}. Assigning new ID.`);
+        stableUserId = `usr_${Math.random().toString(36).substring(2, 11)}`;
+      }
+    }
+
+    const disconnectKey = `${cleanRoomId}:${stableUserId}`;
+    if (pendingDisconnects.has(disconnectKey)) {
+      clearTimeout(pendingDisconnects.get(disconnectKey)!);
+      pendingDisconnects.delete(disconnectKey);
+    }
+
     socket.join(cleanRoomId);
 
-    const room = roomManager.getOrCreateRoom(cleanRoomId, socket.id, cleanUsername);
-    const participant = room.getParticipant(socket.id);
+    let role: Role = 'participant';
+    try {
+      const existingRole = await getRole(cleanRoomId, stableUserId);
+
+      if (existingRole && ['host', 'moderator', 'participant'].includes(existingRole)) {
+        role = existingRole as Role;
+      } else {
+        const existingRoles = await getAllParticipantRoles(cleanRoomId);
+        const hasHost = Object.values(existingRoles).includes('host');
+
+        if (!hasHost) {
+          role = 'host';
+        } else {
+          role = 'participant';
+        }
+
+        await assignRole(cleanRoomId, stableUserId, role);
+      }
+    } catch (err: any) {
+      console.error('[Redis] Error fetching/assigning role:', err.message);
+    }
+
+    const { room } = roomManager.getOrCreateRoom(
+      cleanRoomId,
+      socket.id,
+      cleanUsername,
+      stableUserId,
+      role
+    );
+
+    if (room.messages.length === 0) {
+      try {
+        const storedMessages = await getMessages(cleanRoomId);
+        if (storedMessages.length > 0) {
+          room.messages = storedMessages;
+        }
+      } catch (err: any) {
+        console.error('[Redis] Error loading messages:', err.message);
+      }
+    }
+
+    const participant = room.getParticipant(stableUserId);
     if (!participant) return;
 
     socket.emit('sync_state', room.getState());
@@ -135,7 +198,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     io.to(roomId).emit('sync_state', room.getState());
   });
 
-  socket.on('assign_role', ({ roomId, userId, targetSocketId, role, newRole }) => {
+  socket.on('assign_role', async ({ roomId, userId, targetSocketId, role, newRole }) => {
     const room = roomManager.getRoom(roomId);
     if (!room) return;
 
@@ -150,7 +213,8 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return sendError(socket, 'Target user ID is required.');
     }
 
-    if (targetId === socket.id) {
+    const caller = room.getParticipant(socket.id);
+    if (caller && (targetId === caller.userId || targetId === caller.socketId)) {
       return sendError(socket, 'You cannot change your own role or demote yourself.');
     }
 
@@ -165,6 +229,12 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     const updatedParticipant = room.assignRole(targetId, targetRole);
     if (updatedParticipant) {
+      try {
+        await assignRole(roomId, updatedParticipant.userId, targetRole);
+      } catch (err: any) {
+        console.error('[Redis] Error saving assigned role:', err.message);
+      }
+
       io.to(roomId).emit('role_assigned', {
         userId: updatedParticipant.userId,
         username: updatedParticipant.username,
@@ -173,7 +243,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
         hostSocketId: room.hostSocketId
       });
       io.to(roomId).emit('role_changed', {
-        socketId: updatedParticipant.userId,
+        socketId: updatedParticipant.socketId,
         newRole: updatedParticipant.role,
         hostSocketId: room.hostSocketId
       });
@@ -181,7 +251,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     }
   });
 
-  socket.on('transfer_host', ({ roomId, userId }) => {
+  socket.on('transfer_host', async ({ roomId, userId }) => {
     const room = roomManager.getRoom(roomId);
     if (!room) return;
 
@@ -193,7 +263,8 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return sendError(socket, 'Target user ID is required.');
     }
 
-    if (userId === socket.id) {
+    const caller = room.getParticipant(socket.id);
+    if (caller && (userId === caller.userId || userId === caller.socketId)) {
       return sendError(socket, 'You are already the host.');
     }
 
@@ -202,8 +273,19 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return sendError(socket, 'Target user not found in this room.');
     }
 
+    const previousHost = room.getParticipant(room.hostUserId || room.hostSocketId);
     const updatedParticipant = room.transferHost(userId);
+
     if (updatedParticipant) {
+      try {
+        await assignRole(roomId, updatedParticipant.userId, 'host');
+        if (previousHost && previousHost.userId !== updatedParticipant.userId) {
+          await assignRole(roomId, previousHost.userId, 'moderator');
+        }
+      } catch (err: any) {
+        console.error('[Redis] Error updating host transfer in Redis:', err.message);
+      }
+
       io.to(roomId).emit('role_assigned', {
         userId: updatedParticipant.userId,
         username: updatedParticipant.username,
@@ -212,7 +294,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
         hostSocketId: room.hostSocketId
       });
       io.to(roomId).emit('role_changed', {
-        socketId: updatedParticipant.userId,
+        socketId: updatedParticipant.socketId,
         newRole: 'host',
         hostSocketId: room.hostSocketId
       });
@@ -220,7 +302,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     }
   });
 
-  const handleRemoveParticipant = ({ roomId, userId, targetSocketId }: { roomId: string; userId?: string; targetSocketId?: string }) => {
+  const handleRemoveParticipant = async ({ roomId, userId, targetSocketId }: { roomId: string; userId?: string; targetSocketId?: string }) => {
     const room = roomManager.getRoom(roomId);
     if (!room) return;
 
@@ -233,7 +315,8 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return sendError(socket, 'Target user ID is required.');
     }
 
-    if (targetId === socket.id) {
+    const caller = room.getParticipant(socket.id);
+    if (caller && (targetId === caller.userId || targetId === caller.socketId)) {
       return sendError(socket, 'The Host cannot remove themselves.');
     }
 
@@ -242,16 +325,28 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return sendError(socket, 'Target user not found in this room.');
     }
 
-    const targetSocket = io.sockets.sockets.get(targetId);
+    const targetSocket = io.sockets.sockets.get(targetParticipant.socketId);
     if (targetSocket) {
       targetSocket.emit('kicked', { message: 'You were removed from the room by the host.' });
       targetSocket.leave(roomId);
     }
 
-    room.removeParticipant(targetId);
+    const disconnectKey = `${roomId}:${targetParticipant.userId}`;
+    if (pendingDisconnects.has(disconnectKey)) {
+      clearTimeout(pendingDisconnects.get(disconnectKey)!);
+      pendingDisconnects.delete(disconnectKey);
+    }
+
+    room.removeParticipant(targetParticipant.userId);
+
+    try {
+      await removeParticipantRole(roomId, targetParticipant.userId);
+    } catch (err: any) {
+      console.error('[Redis] Error removing participant role on kick:', err.message);
+    }
 
     io.to(roomId).emit('participant_removed', {
-      userId: targetId,
+      userId: targetParticipant.userId,
       participants: room.getParticipantList()
     });
     io.to(roomId).emit('sync_state', room.getState());
@@ -302,9 +397,9 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     room.addActionRequest(actionReq);
 
-    for (const [pSocketId, participant] of room.participants.entries()) {
+    for (const [pUserId, participant] of room.participants.entries()) {
       if (participant.role === 'host' || participant.role === 'moderator') {
-        const pSocket = io.sockets.sockets.get(pSocketId);
+        const pSocket = io.sockets.sockets.get(participant.socketId);
         if (pSocket) {
           pSocket.emit('action_requested', actionReq);
         }
@@ -362,7 +457,8 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       });
       io.to(roomId).emit('sync_state', room.getState());
     } else if (actionReq.type === 'change_video') {
-      room.updatePlaybackState({ videoId: actionReq.payload?.videoId, 
+      room.updatePlaybackState({ 
+        videoId: actionReq.payload?.videoId, 
         currentTime: 0, 
         isPlaying: true 
       });
@@ -406,11 +502,17 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     io.to(roomId).emit('action_resolved', { requestId });
   });
 
-  const handleMessage = ({ roomId, text }: { roomId: string; text: string }) => {
+  const handleMessage = async ({ roomId, text }: { roomId: string; text: string }) => {
     const room = roomManager.getRoom(roomId);
     if (!room || !text?.trim()) return;
 
     const message = room.addMessage(socket.id, text.trim());
+    try {
+      await saveMessages(roomId, message);
+    } catch (err: any) {
+      console.error('[Redis] Error saving message:', err.message);
+    }
+
     io.to(roomId).emit('new_message', message);
     io.to(roomId).emit('chat_message', message);
   };
@@ -426,7 +528,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     const payload = {
       id: Math.random().toString(36).substring(2, 9),
       emoji,
-      userId: socket.id,
+      userId: participant ? participant.userId : socket.id,
       username: participant ? participant.username : 'User'
     };
     io.to(roomId).emit('new_reaction', payload);
@@ -436,44 +538,110 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
   socket.on('send_reaction', handleReaction);
   socket.on('reaction', handleReaction);
 
-  const handleLeave = () => {
+  // Explicit leave: immediate removal
+  const handleExplicitLeave = () => {
     const room = roomManager.getRoomBySocketId(socket.id);
     if (!room) return;
 
-    const roomId = room.id;
-    const participant = room.removeParticipant(socket.id);
+    const participant = room.getParticipant(socket.id);
+    if (!participant) return;
+
+    const disconnectKey = `${room.id}:${participant.userId}`;
+    if (pendingDisconnects.has(disconnectKey)) {
+      clearTimeout(pendingDisconnects.get(disconnectKey)!);
+      pendingDisconnects.delete(disconnectKey);
+    }
+
+    room.removeParticipant(participant.userId);
 
     if (room.participants.size === 0) {
-      roomManager.removeRoom(roomId);
+      roomManager.removeRoom(room.id);
     } else {
-      io.to(roomId).emit('user_left', {
-        userId: socket.id,
-        username: participant ? participant.username : 'Guest',
+      io.to(room.id).emit('user_left', {
+        userId: participant.userId,
+        username: participant.username,
         participants: room.getParticipantList(),
         hostSocketId: room.hostSocketId
       });
 
-      const currentHost = room.getParticipant(room.hostSocketId);
+      const currentHost = room.getParticipant(room.hostUserId || room.hostSocketId);
       if (currentHost) {
-        io.to(roomId).emit('role_assigned', {
+        io.to(room.id).emit('role_assigned', {
           userId: currentHost.userId,
           username: currentHost.username,
           role: 'host',
           participants: room.getParticipantList(),
           hostSocketId: room.hostSocketId
         });
-        io.to(roomId).emit('role_changed', {
-          socketId: currentHost.userId,
+        io.to(room.id).emit('role_changed', {
+          socketId: currentHost.socketId,
           newRole: 'host',
           hostSocketId: room.hostSocketId
         });
       }
-      io.to(roomId).emit('sync_state', room.getState());
+      io.to(room.id).emit('sync_state', room.getState());
     }
   };
 
-  socket.on('leave_room', handleLeave);
-  socket.on('disconnect', handleLeave);
+  // Disconnect: apply grace period to tolerate page refreshes without dropping role or user
+  const handleDisconnect = () => {
+    const room = roomManager.getRoomBySocketId(socket.id);
+    if (!room) return;
+
+    const participant = room.getParticipant(socket.id);
+    if (!participant) return;
+
+    const roomId = room.id;
+    const userId = participant.userId;
+    const disconnectKey = `${roomId}:${userId}`;
+
+    if (pendingDisconnects.has(disconnectKey)) {
+      clearTimeout(pendingDisconnects.get(disconnectKey)!);
+    }
+
+    const timer = setTimeout(() => {
+      pendingDisconnects.delete(disconnectKey);
+
+      const currentParticipant = room.getParticipant(userId);
+      // If participant still has the disconnected socketId, they haven't reconnected
+      if (currentParticipant && currentParticipant.socketId === socket.id) {
+        room.removeParticipant(userId);
+
+        if (room.participants.size === 0) {
+          roomManager.removeRoom(roomId);
+        } else {
+          io.to(roomId).emit('user_left', {
+            userId: currentParticipant.userId,
+            username: currentParticipant.username,
+            participants: room.getParticipantList(),
+            hostSocketId: room.hostSocketId
+          });
+
+          const currentHost = room.getParticipant(room.hostUserId || room.hostSocketId);
+          if (currentHost) {
+            io.to(roomId).emit('role_assigned', {
+              userId: currentHost.userId,
+              username: currentHost.username,
+              role: 'host',
+              participants: room.getParticipantList(),
+              hostSocketId: room.hostSocketId
+            });
+            io.to(roomId).emit('role_changed', {
+              socketId: currentHost.socketId,
+              newRole: 'host',
+              hostSocketId: room.hostSocketId
+            });
+          }
+          io.to(roomId).emit('sync_state', room.getState());
+        }
+      }
+    }, 8000); // 8-second grace period for refresh/reconnection
+
+    pendingDisconnects.set(disconnectKey, timer);
+  };
+
+  socket.on('leave_room', handleExplicitLeave);
+  socket.on('disconnect', handleDisconnect);
 });
 
 server.listen(PORT, () => {

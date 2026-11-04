@@ -17,6 +17,7 @@ export interface RoomState {
   playState: 'playing' | 'paused';
   hostSocketId: string;
   participants: ParticipantData[];
+  messages?: ChatMessage[];
 }
 
 export interface ChatMessage {
@@ -76,7 +77,7 @@ export interface ErrorMessagePayload {
 }
 
 export interface ClientToServerEvents {
-  join_room: (data: { roomId: string; username: string }) => void;
+  join_room: (data: { roomId: string; username: string; participantId?: string; participantToken?: string }) => void;
   leave_room: () => void;
   play: (data: { roomId: string; currentTime: number }) => void;
   pause: (data: { roomId: string; currentTime: number }) => void;

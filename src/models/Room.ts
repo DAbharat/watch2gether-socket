@@ -12,55 +12,99 @@ export const SHADCN_AVATARS: string[] = [
 export class Room {
   id: string;
   hostSocketId: string;
+  hostUserId: string;
   videoId: string;
   currentTime: number;
   isPlaying: boolean;
   lastUpdated: number;
-  participants: Map<string, Participant>;
+  participants: Map<string, Participant>; // Keyed by stable userId
+  socketToUserId: Map<string, string>;   // Maps socketId -> userId
   messages: ChatMessage[];
   pendingRequests: Map<string, ActionRequest>;
   joinCounter: number = 0;
 
-  constructor(id: string, hostSocketId: string, hostUsername: string) {
+  constructor(id: string, hostSocketId: string, hostUsername: string, hostUserId?: string) {
     this.id = id;
     this.hostSocketId = hostSocketId;
+    this.hostUserId = hostUserId || hostSocketId;
     this.videoId = 'dQw4w9WgXcQ';
     this.currentTime = 0;
     this.isPlaying = false;
     this.lastUpdated = Date.now();
     this.participants = new Map();
+    this.socketToUserId = new Map();
     this.messages = [];
     this.pendingRequests = new Map();
 
-    this.addParticipant(hostSocketId, hostUsername, 'host');
+    this.addOrUpdateParticipant(this.hostUserId, hostSocketId, hostUsername, 'host');
   }
 
-  addParticipant(socketId: string, username: string, role: Role = 'participant'): Participant {
+  addOrUpdateParticipant(
+    userId: string,
+    socketId: string,
+    username: string,
+    role: Role = 'participant'
+  ): { participant: Participant; isNew: boolean } {
+    const existing = this.participants.get(userId);
+
+    if (existing) {
+      if (existing.socketId && existing.socketId !== socketId) {
+        this.socketToUserId.delete(existing.socketId);
+      }
+      existing.socketId = socketId;
+      if (username) existing.username = username;
+      if (role) existing.role = role;
+
+      this.socketToUserId.set(socketId, userId);
+
+      if (existing.role === 'host') {
+        this.hostSocketId = socketId;
+        this.hostUserId = userId;
+      }
+
+      return { participant: existing, isNew: false };
+    }
+
     const avatarIndex = this.joinCounter % SHADCN_AVATARS.length;
     this.joinCounter++;
     const avatar = SHADCN_AVATARS[avatarIndex];
-    const participant = new Participant(socketId, username, role, avatar);
-    this.participants.set(socketId, participant);
-    return participant;
+
+    const participant = new Participant(userId, socketId, username, role, avatar);
+    this.participants.set(userId, participant);
+    this.socketToUserId.set(socketId, userId);
+
+    if (role === 'host') {
+      this.hostSocketId = socketId;
+      this.hostUserId = userId;
+    }
+
+    return { participant, isNew: true };
   }
 
-  removeParticipant(socketId: string): Participant | undefined {
-    const participant = this.participants.get(socketId);
-    this.participants.delete(socketId);
+  removeParticipant(socketIdOrUserId: string): Participant | undefined {
+    const participant = this.getParticipant(socketIdOrUserId);
+    if (!participant) return undefined;
+
+    this.participants.delete(participant.userId);
+    this.socketToUserId.delete(participant.socketId);
 
     // Clean up any pending requests made by this user
     for (const [reqId, req] of this.pendingRequests.entries()) {
-      if (req.requesterId === socketId) {
+      if (req.requesterId === participant.socketId || req.requesterId === participant.userId) {
         this.pendingRequests.delete(reqId);
       }
     }
 
     // Auto-promote: If host left/disconnected, promote a Moderator first, else first participant
-    if (this.hostSocketId === socketId && this.participants.size > 0) {
+    if (
+      (this.hostUserId === participant.userId || this.hostSocketId === participant.socketId) &&
+      this.participants.size > 0
+    ) {
       const participantsList = Array.from(this.participants.values());
       const nextHost = participantsList.find((p) => p.role === 'moderator') || participantsList[0];
       if (nextHost) {
         nextHost.role = 'host';
+        this.hostUserId = nextHost.userId;
         this.hostSocketId = nextHost.socketId;
       }
     }
@@ -68,39 +112,44 @@ export class Room {
     return participant;
   }
 
-  getParticipant(socketId: string): Participant | undefined {
-    return this.participants.get(socketId);
+  getParticipant(socketIdOrUserId: string): Participant | undefined {
+    const userId = this.socketToUserId.get(socketIdOrUserId);
+    if (userId) {
+      return this.participants.get(userId);
+    }
+    return this.participants.get(socketIdOrUserId);
   }
 
-  canControl(socketId: string): boolean {
-    const p = this.participants.get(socketId);
+  canControl(socketIdOrUserId: string): boolean {
+    const p = this.getParticipant(socketIdOrUserId);
     return Boolean(p && (p.role === 'host' || p.role === 'moderator'));
   }
 
-  isHost(socketId: string): boolean {
-    const p = this.participants.get(socketId);
+  isHost(socketIdOrUserId: string): boolean {
+    const p = this.getParticipant(socketIdOrUserId);
     return Boolean(p && p.role === 'host');
   }
 
-  assignRole(targetSocketId: string, newRole: Role): Participant | null {
-    const p = this.participants.get(targetSocketId);
+  assignRole(targetId: string, newRole: Role): Participant | null {
+    const p = this.getParticipant(targetId);
     if (!p) return null;
 
     if (newRole === 'host') {
-      const currentHost = this.participants.get(this.hostSocketId);
-      if (currentHost && currentHost.socketId !== targetSocketId) {
+      const currentHost = this.getParticipant(this.hostUserId || this.hostSocketId);
+      if (currentHost && currentHost.userId !== p.userId) {
         currentHost.role = 'moderator';
       }
       p.role = 'host';
-      this.hostSocketId = targetSocketId;
+      this.hostUserId = p.userId;
+      this.hostSocketId = p.socketId;
     } else {
       p.role = newRole;
     }
     return p;
   }
 
-  transferHost(targetSocketId: string): Participant | null {
-    return this.assignRole(targetSocketId, 'host');
+  transferHost(targetId: string): Participant | null {
+    return this.assignRole(targetId, 'host');
   }
 
   addActionRequest(request: ActionRequest): void {
@@ -152,15 +201,16 @@ export class Room {
       isPlaying: this.isPlaying,
       playState: this.isPlaying ? 'playing' : 'paused',
       hostSocketId: this.hostSocketId,
-      participants: this.getParticipantList()
+      participants: this.getParticipantList(),
+      messages: this.messages,
     };
   }
 
-  addMessage(socketId: string, text: string): ChatMessage {
-    const p = this.participants.get(socketId);
+  addMessage(socketIdOrUserId: string, text: string): ChatMessage {
+    const p = this.getParticipant(socketIdOrUserId);
     const msg: ChatMessage = {
       id: Math.random().toString(36).substring(2, 9),
-      userId: socketId,
+      userId: p ? p.userId : socketIdOrUserId,
       username: p ? p.username : 'Unknown',
       role: p ? p.role : 'participant',
       text,
@@ -168,7 +218,7 @@ export class Room {
       avatar: p ? p.avatar : SHADCN_AVATARS[0],
     };
     this.messages.push(msg);
-    if (this.messages.length > 100) this.messages.shift();
+    if (this.messages.length > 150) this.messages.shift();
     return msg;
   }
 }
