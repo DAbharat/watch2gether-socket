@@ -13,7 +13,33 @@ import { verifyParticipantToken } from './config/storage/participant/participant
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-app.use(cors());
+// Parse allowed frontend origins from CLIENT_URL (supports comma-separated URLs or '*')
+const rawClientUrls = process.env.CLIENT_URL || process.env.FRONTEND_URL || '*';
+const allowedOrigins = rawClientUrls.split(',').map((url) => url.trim().replace(/\/$/, ''));
+
+const isOriginAllowed = (origin: string | undefined): boolean => {
+  if (!origin) return true;
+  if (allowedOrigins.includes('*')) return true;
+  if (allowedOrigins.includes(origin)) return true;
+  // Always permit local development ports (e.g. http://localhost:3000)
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
+  return false;
+};
+
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    if (isOriginAllowed(origin)) {
+      callback(null, true);
+    } else {
+      callback(null, false);
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-requested-with']
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
 app.get('/health', (req, res) => {
@@ -33,8 +59,15 @@ const server = http.createServer(app);
 
 const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
+    origin: (origin, callback) => {
+      if (isOriginAllowed(origin)) {
+        callback(null, true);
+      } else {
+        callback(null, false);
+      }
+    },
+    methods: ['GET', 'POST'],
+    credentials: true
   }
 });
 

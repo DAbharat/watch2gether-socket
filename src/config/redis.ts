@@ -7,7 +7,7 @@ declare global {
 
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 
-const createRedisClient = () => new Redis(REDIS_URL, {
+const redisOptions: any = {
   maxRetriesPerRequest: null,
   connectTimeout: Number(process.env.REDIS_TIMEOUT) || 5000,
   retryStrategy(times: number) {
@@ -23,7 +23,16 @@ const createRedisClient = () => new Redis(REDIS_URL, {
 
     return delay;
   }
-});
+};
+
+// Enable TLS for secure connections (e.g. Render external Redis rediss:// URL)
+if (REDIS_URL.startsWith('rediss://')) {
+  redisOptions.tls = {
+    rejectUnauthorized: false
+  };
+}
+
+const createRedisClient = () => new Redis(REDIS_URL, redisOptions);
 
 const redis = global.redisClient || createRedisClient();
 
