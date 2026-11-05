@@ -25,6 +25,10 @@ export class RoomManager {
     return this.rooms.get(roomId);
   }
 
+  hasRoom(roomId: string): boolean {
+    return this.rooms.has(roomId);
+  }
+
   getOrCreateRoom(
     roomId: string,
     socketId: string,
