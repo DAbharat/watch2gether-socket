@@ -57,6 +57,16 @@ export class Room {
     username: string,
     role: Role = 'participant'
   ): { participant: Participant; isNew: boolean } {
+    // Only clean up if another entry is holding this exact active socket
+    if (socketId) {
+      for (const [existingId, p] of this.participants.entries()) {
+        if (existingId !== userId && p.socketId && p.socketId === socketId) {
+          this.participants.delete(existingId);
+          this.socketToUserId.delete(socketId);
+        }
+      }
+    }
+
     const existing = this.participants.get(userId);
 
     if (existing) {

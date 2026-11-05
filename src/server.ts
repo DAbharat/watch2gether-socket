@@ -310,8 +310,12 @@ async function processUserDisconnection(
   const currentHostId = (await getRoomHost(roomId)) || room.hostUserId;
   const isHost = (currentHostId === userId || participant.role === 'host');
 
+  // Verify how many participants are still connected using both Redis and active in-memory socket sessions
+  const inMemoryConnectedCount = room.getConnectedParticipants().filter(p => p.userId !== userId && p.socketId !== socketId).length;
+  const effectiveRemaining = Math.max(remainingConnected, inMemoryConnectedCount);
+
   // Case B.2: When the last connected participant leaves (count == 0)
-  if (remainingConnected <= 0) {
+  if (effectiveRemaining <= 0) {
     console.log(`[Lifecycle] Last participant left room ${roomId}. Applying 5-minute empty room TTL.`);
     if (hostGraceTimers.has(roomId)) {
       clearTimeout(hostGraceTimers.get(roomId)!);
@@ -334,7 +338,7 @@ async function processUserDisconnection(
 
   // Case A.1: The Host left while other participants remain (count > 0)
   if (isHost) {
-    console.log(`[Lifecycle] Host ${userId} disconnected with ${remainingConnected} participants remaining. Starting 60s grace period.`);
+    console.log(`[Lifecycle] Host ${userId} disconnected with ${effectiveRemaining} participants remaining. Starting 60s grace period.`);
     room.markParticipantDisconnected(userId);
 
     const marker = await setHostGrace(roomId, userId, 60000);
@@ -373,12 +377,8 @@ async function processUserDisconnection(
   }
 
   // Case: Non-host left
-  if (isExplicitLeave) {
-    room.removeParticipant(userId);
-    removeParticipantRole(roomId, userId).catch(() => {});
-  } else {
-    room.markParticipantDisconnected(userId);
-  }
+  room.removeParticipant(userId);
+  removeParticipantRole(roomId, userId).catch(() => {});
 
   removeUserPendingRequests(roomId, userId).then(async (droppedIds) => {
     if (droppedIds.length > 0) {
@@ -1561,8 +1561,9 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     }
   });
 
-  const handleExplicitLeave = async () => {
-    const room = roomManager.getRoomBySocketId(socket.id);
+  const handleExplicitLeave = async (data?: { roomId?: string }) => {
+    const targetRoomId = (data && typeof data.roomId === 'string' && data.roomId.trim()) ? data.roomId.trim() : null;
+    const room = (targetRoomId ? roomManager.getRoom(targetRoomId) : null) || roomManager.getRoomBySocketId(socket.id);
     if (!room) return;
 
     const participant = room.getParticipant(socket.id);
