@@ -7,13 +7,15 @@ export class Participant implements ParticipantData {
   role: Role;
   joinedAt: number;
   avatar: string;
+  connected: boolean;
 
   constructor(
     userId: string,
     socketId: string,
     username: string,
     role: Role = 'participant',
-    avatar: string = '/avatars/01.png'
+    avatar: string = '/avatars/01.png',
+    connected: boolean = true
   ) {
     this.userId = userId || socketId;
     this.socketId = socketId;
@@ -21,6 +23,7 @@ export class Participant implements ParticipantData {
     this.role = role;
     this.joinedAt = Date.now();
     this.avatar = avatar;
+    this.connected = connected;
   }
 
   toJSON(): ParticipantData {
@@ -31,6 +34,7 @@ export class Participant implements ParticipantData {
       role: this.role,
       joinedAt: this.joinedAt,
       avatar: this.avatar,
+      connected: this.connected,
     };
   }
 }

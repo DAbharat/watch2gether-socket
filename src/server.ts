@@ -7,6 +7,25 @@ import { roomManager } from './models/RoomManager.js';
 import { Room } from './models/Room.js';
 import { ClientToServerEvents, ServerToClientEvents, Role, ActionRequest } from './types.js';
 import { assignRole, getRole, getAllParticipantRoles, removeParticipantRole, getRoomHost, setRoomHost, removeRoomHost } from './config/storage/role.js';
+import {
+  setRoomTTL,
+  refreshRoomActivity,
+  addConnectedParticipant,
+  removeConnectedParticipantAtomic,
+  getConnectedCount,
+  isParticipantConnected,
+  clearAllConnectedSets,
+  setHostGrace,
+  getHostGrace,
+  clearHostGrace,
+  atomicTransferHost,
+  atomicCheckAndPromoteHost,
+  saveRoomState,
+  getRoomState,
+  checkRoomExists,
+  scanAllGraceMarkers,
+  EMPTY_ROOM_TTL,
+} from './config/storage/roomLifecycle.js';
 import { saveMessages, getMessages } from './config/storage/chat.js';
 import { verifyParticipantToken } from './config/storage/participant/participant.js';
 import {
@@ -109,16 +128,303 @@ function sendError(socket: Socket<ClientToServerEvents, ServerToClientEvents>, m
   socket.emit('error', { message });
 }
 
-// Grace period tracker: key = `${roomId}:${userId}` -> NodeJS.Timeout
-const pendingDisconnects = new Map<string, NodeJS.Timeout>();
+// Grace period tracker: key = roomId -> NodeJS.Timeout (60s host grace period)
+const hostGraceTimers = new Map<string, NodeJS.Timeout>();
+
+// Disconnect debounce tracker: key = `${roomId}:${userId}` -> NodeJS.Timeout (2s debounce for page refresh/flapping)
+const disconnectDebounceTimers = new Map<string, NodeJS.Timeout>();
+
+/**
+ * Executes automatic host promotion after grace period ends without host returning.
+ * Promotion order: connected Moderator first (longest-present first),
+ * otherwise longest-present connected Participant.
+ */
+async function executeHostPromotion(roomId: string, reason?: string) {
+  const room = roomManager.getRoom(roomId);
+  const graceMarker = await getHostGrace(roomId);
+  const currentHostId = (await getRoomHost(roomId)) || (room ? room.hostUserId : null);
+  const departedHostId = graceMarker ? graceMarker.hostId : currentHostId;
+
+  if (!departedHostId) {
+    if (hostGraceTimers.has(roomId)) {
+      clearTimeout(hostGraceTimers.get(roomId)!);
+      hostGraceTimers.delete(roomId);
+    }
+    await clearHostGrace(roomId);
+    return;
+  }
+
+  // Double-check if the departed host has reconnected before promoting
+  const isHostConnected = await isParticipantConnected(roomId, departedHostId);
+  if (isHostConnected) {
+    console.log(`[Lifecycle] Host ${departedHostId} is connected; skipping promotion for room ${roomId}.`);
+    if (hostGraceTimers.has(roomId)) {
+      clearTimeout(hostGraceTimers.get(roomId)!);
+      hostGraceTimers.delete(roomId);
+    }
+    await clearHostGrace(roomId);
+    return;
+  }
+
+  let nextHostCandidate: { userId: string; username: string; socketId: string } | null = null;
+  let oldHostUsername = 'Host';
+
+  if (room) {
+    const oldHostP = room.getParticipant(departedHostId);
+    if (oldHostP) oldHostUsername = oldHostP.username;
+
+    const connectedParticipants = room.getConnectedParticipants().filter(p => p.userId !== departedHostId);
+    const connectedMods = connectedParticipants
+      .filter(p => p.role === 'moderator')
+      .sort((a, b) => a.joinedAt - b.joinedAt);
+    const connectedRegulars = connectedParticipants
+      .filter(p => p.role === 'participant')
+      .sort((a, b) => a.joinedAt - b.joinedAt);
+
+    const chosen = connectedMods[0] || connectedRegulars[0];
+    if (chosen) {
+      nextHostCandidate = {
+        userId: chosen.userId,
+        username: chosen.username,
+        socketId: chosen.socketId
+      };
+    }
+  }
+
+  if (!nextHostCandidate) {
+    console.log(`[Lifecycle] No connected candidate to promote in room ${roomId}.`);
+    if (hostGraceTimers.has(roomId)) {
+      clearTimeout(hostGraceTimers.get(roomId)!);
+      hostGraceTimers.delete(roomId);
+    }
+    await clearHostGrace(roomId);
+    return;
+  }
+
+  const promoted = await atomicCheckAndPromoteHost(roomId, departedHostId, nextHostCandidate.userId);
+  if (promoted) {
+    console.log(`[Lifecycle] Promoted ${nextHostCandidate.username} (${nextHostCandidate.userId}) to host in room ${roomId}. Reason: ${reason || 'Grace ended'}`);
+    if (hostGraceTimers.has(roomId)) {
+      clearTimeout(hostGraceTimers.get(roomId)!);
+      hostGraceTimers.delete(roomId);
+    }
+    await clearHostGrace(roomId);
+
+    if (room) {
+      const oldHostP = room.getParticipant(departedHostId);
+      if (oldHostP) {
+        oldHostP.role = 'moderator';
+      }
+      const newHostP = room.getParticipant(nextHostCandidate.userId);
+      if (newHostP) {
+        newHostP.role = 'host';
+        room.hostUserId = newHostP.userId;
+        room.hostSocketId = newHostP.socketId;
+      }
+
+      io.to(roomId).emit('role_assigned', {
+        userId: nextHostCandidate.userId,
+        username: nextHostCandidate.username,
+        role: 'host',
+        participants: room.getParticipantList(),
+        hostSocketId: room.hostSocketId
+      });
+      io.to(roomId).emit('role_changed', {
+        socketId: nextHostCandidate.socketId,
+        newRole: 'host',
+        hostSocketId: room.hostSocketId
+      });
+      io.to(roomId).emit('toast_notification', {
+        title: 'New Host Assigned',
+        message: `${oldHostUsername} left. ${nextHostCandidate.username} is now the host.`,
+        type: 'info'
+      });
+      if (nextHostCandidate.socketId) {
+        io.to(nextHostCandidate.socketId).emit('toast_notification', {
+          title: 'Host Status',
+          message: 'You are now the host.',
+          type: 'success'
+        });
+      }
+      io.to(roomId).emit('host_grace_cancelled', { hostId: departedHostId });
+      io.to(roomId).emit('sync_state', room.getState());
+    }
+    await refreshRoomActivity(roomId);
+  }
+}
+
+/**
+ * Lazy check for expired grace marker on room actions / join.
+ */
+async function checkHostGraceLazily(roomId: string) {
+  const marker = await getHostGrace(roomId);
+  if (!marker) return null;
+
+  if (Date.now() >= marker.deadline) {
+    console.log(`[Lifecycle] Lazy check: Grace expired for room ${roomId}, promoting...`);
+    await executeHostPromotion(roomId, 'Grace deadline passed');
+    return null;
+  }
+  return marker;
+}
+
+/**
+ * Core user disconnection processor with empty-room cleanup and host grace period.
+ */
+async function processUserDisconnection(
+  roomId: string,
+  userId: string,
+  socketId: string,
+  isExplicitLeave: boolean = false
+) {
+  const remainingConnected = await removeConnectedParticipantAtomic(roomId, userId);
+  console.log(`[Lifecycle] User ${userId} disconnected from room ${roomId}. Remaining connected: ${remainingConnected}`);
+
+  const room = roomManager.getRoom(roomId);
+  if (!room) return;
+
+  const participant = room.getParticipant(userId);
+  if (!participant) return;
+
+  const currentHostId = (await getRoomHost(roomId)) || room.hostUserId;
+  const isHost = (currentHostId === userId || participant.role === 'host');
+
+  // Case B.2: When the last connected participant leaves (count == 0)
+  if (remainingConnected <= 0) {
+    console.log(`[Lifecycle] Last participant left room ${roomId}. Applying 5-minute empty room TTL.`);
+    if (hostGraceTimers.has(roomId)) {
+      clearTimeout(hostGraceTimers.get(roomId)!);
+      hostGraceTimers.delete(roomId);
+    }
+    await clearHostGrace(roomId);
+
+    await saveRoomState(roomId, {
+      videoId: room.videoId,
+      currentTime: room.getCalculatedCurrentTime(),
+      isPlaying: room.isPlaying,
+      anchorPosition: room.anchorPosition,
+      anchorServerTime: room.anchorServerTime
+    });
+
+    await setRoomTTL(roomId, EMPTY_ROOM_TTL);
+    room.markParticipantDisconnected(userId);
+    return;
+  }
+
+  // Case A.1: The Host left while other participants remain (count > 0)
+  if (isHost) {
+    console.log(`[Lifecycle] Host ${userId} disconnected with ${remainingConnected} participants remaining. Starting 60s grace period.`);
+    room.markParticipantDisconnected(userId);
+
+    const marker = await setHostGrace(roomId, userId, 60000);
+
+    io.to(roomId).emit('toast_notification', {
+      title: 'Host Disconnected',
+      message: 'Host disconnected. Waiting 60 seconds before assigning a new host.',
+      type: 'warning'
+    });
+
+    io.to(roomId).emit('host_grace_started', {
+      hostId: userId,
+      deadline: marker.deadline,
+      remainingSeconds: 60
+    });
+
+    io.to(roomId).emit('participants_update', room.getParticipantList());
+    io.to(roomId).emit('user_left', {
+      userId,
+      username: participant.username,
+      participants: room.getParticipantList(),
+      hostSocketId: room.hostSocketId
+    });
+
+    if (hostGraceTimers.has(roomId)) {
+      clearTimeout(hostGraceTimers.get(roomId)!);
+    }
+
+    const timer = setTimeout(async () => {
+      hostGraceTimers.delete(roomId);
+      await executeHostPromotion(roomId, '60s grace period ended');
+    }, 60000);
+
+    hostGraceTimers.set(roomId, timer);
+    return;
+  }
+
+  // Case: Non-host left
+  if (isExplicitLeave) {
+    room.removeParticipant(userId);
+    removeParticipantRole(roomId, userId).catch(() => {});
+  } else {
+    room.markParticipantDisconnected(userId);
+  }
+
+  removeUserPendingRequests(roomId, userId).then(async (droppedIds) => {
+    if (droppedIds.length > 0) {
+      const refreshed = await getAllRequests(roomId);
+      for (const [_, p] of room.participants.entries()) {
+        if (p.role === 'host' || p.role === 'moderator') {
+          io.sockets.sockets.get(p.socketId)?.emit('requests_sync', { requests: refreshed });
+        }
+      }
+    }
+  }).catch(() => {});
+
+  io.to(roomId).emit('user_left', {
+    userId,
+    username: participant.username,
+    participants: room.getParticipantList(),
+    hostSocketId: room.hostSocketId
+  });
+  io.to(roomId).emit('sync_state', room.getState());
+}
+
+/**
+ * On server startup: prunes stale room:*:connected keys and restores/schedules active grace timers.
+ */
+async function initializeServerLifecycle() {
+  try {
+    await clearAllConnectedSets();
+    const markers = await scanAllGraceMarkers();
+    for (const { roomId, marker } of markers) {
+      const remaining = marker.deadline - Date.now();
+      if (remaining <= 0) {
+        console.log(`[Lifecycle] Expired grace marker found for room ${roomId}, promoting immediately.`);
+        await executeHostPromotion(roomId, 'Expired on startup');
+      } else {
+        console.log(`[Lifecycle] Active grace marker found for room ${roomId}, rescheduling for ${Math.round(remaining / 1000)}s.`);
+        const timer = setTimeout(() => {
+          executeHostPromotion(roomId, 'Startup rescheduled timer').catch(err => console.error('[Lifecycle] Promotion failed:', err));
+        }, remaining);
+        hostGraceTimers.set(roomId, timer);
+      }
+    }
+  } catch (err: any) {
+    console.error('[Lifecycle] Startup initialization error:', err.message);
+  }
+}
 
 io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
   console.log(`[Connected] Socket ID: ${socket.id}`);
 
-  socket.on('join_room', async ({ roomId, username, participantId, participantToken }) => {
+  socket.on('join_room', async ({ roomId, username, participantId, participantToken, isCreating }) => {
     if (!roomId) return;
     const cleanRoomId = roomId.trim();
     const cleanUsername = (username || 'Guest').trim();
+
+    // Verify room existence: check memory & Redis
+    const roomInMemory = roomManager.getRoom(cleanRoomId);
+    const roomInRedis = await checkRoomExists(cleanRoomId);
+
+    if (!roomInMemory && !roomInRedis && !isCreating) {
+      console.log(`[Lifecycle] Unknown or expired room ${cleanRoomId} joined without create flag.`);
+      sendError(socket, 'This room no longer exists.');
+      socket.emit('room_not_found', {
+        roomId: cleanRoomId,
+        message: 'This room no longer exists.'
+      });
+      return;
+    }
 
     let stableUserId = (participantId || '').trim();
     if (!stableUserId) {
@@ -133,47 +439,68 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       }
     }
 
+    // Cancel 2-second reconnect debounce if user reconnected quickly
     const disconnectKey = `${cleanRoomId}:${stableUserId}`;
-    if (pendingDisconnects.has(disconnectKey)) {
-      clearTimeout(pendingDisconnects.get(disconnectKey)!);
-      pendingDisconnects.delete(disconnectKey);
+    if (disconnectDebounceTimers.has(disconnectKey)) {
+      clearTimeout(disconnectDebounceTimers.get(disconnectKey)!);
+      disconnectDebounceTimers.delete(disconnectKey);
     }
 
     socket.join(cleanRoomId);
 
-    const existingRoom = roomManager.getRoom(cleanRoomId);
+    // Lazy check grace marker
+    await checkHostGraceLazily(cleanRoomId);
+
+    // Check if user is returning host during active grace period
+    const activeGrace = await getHostGrace(cleanRoomId);
+    const isReturningHostInGrace = Boolean(activeGrace && activeGrace.hostId === stableUserId);
+
+    if (isReturningHostInGrace) {
+      console.log(`[Lifecycle] Host ${stableUserId} returned within grace period!`);
+      if (hostGraceTimers.has(cleanRoomId)) {
+        clearTimeout(hostGraceTimers.get(cleanRoomId)!);
+        hostGraceTimers.delete(cleanRoomId);
+      }
+      await clearHostGrace(cleanRoomId);
+      io.to(cleanRoomId).emit('host_grace_cancelled', { hostId: stableUserId });
+      io.to(cleanRoomId).emit('toast_notification', {
+        title: 'Host is Back',
+        message: 'Host is back.',
+        type: 'success'
+      });
+    }
+
     let role: Role = 'participant';
     let designatedHostId: string | null = null;
 
     try {
       designatedHostId = await getRoomHost(cleanRoomId);
       const existingRole = await getRole(cleanRoomId, stableUserId);
+      const connectedCount = await getConnectedCount(cleanRoomId);
 
-      if (designatedHostId) {
-        if (stableUserId === designatedHostId) {
-          role = 'host';
-          await assignRole(cleanRoomId, stableUserId, 'host');
-        } else if (existingRole && ['moderator', 'participant'].includes(existingRole)) {
-          role = existingRole as Role;
-        } else {
-          role = 'participant';
-          await assignRole(cleanRoomId, stableUserId, 'participant');
-        }
-      } else {
+      if (isReturningHostInGrace || (designatedHostId && stableUserId === designatedHostId)) {
         role = 'host';
         designatedHostId = stableUserId;
-        await setRoomHost(cleanRoomId, stableUserId);
-        await assignRole(cleanRoomId, stableUserId, 'host');
+      } else if (!designatedHostId || connectedCount === 0) {
+        // If room had no host (the only member left while being host), first person to rejoin becomes Host
+        role = 'host';
+        designatedHostId = stableUserId;
+        await atomicTransferHost(cleanRoomId, stableUserId);
+      } else if (existingRole && ['moderator', 'participant'].includes(existingRole)) {
+        role = existingRole as Role;
+      } else {
+        role = 'participant';
+        await assignRole(cleanRoomId, stableUserId, 'participant');
       }
     } catch (err: any) {
       console.error('[Redis] Error fetching/assigning role:', err.message);
-      if (!existingRoom || existingRoom.participants.size === 0) {
+      if (!roomInMemory || roomInMemory.participants.size === 0) {
         role = 'host';
         designatedHostId = stableUserId;
       }
     }
 
-    const { room } = roomManager.getOrCreateRoom(
+    const { room, isNewRoom } = roomManager.getOrCreateRoom(
       cleanRoomId,
       socket.id,
       cleanUsername,
@@ -182,10 +509,32 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       designatedHostId || undefined
     );
 
+    if (isNewRoom) {
+      try {
+        const savedState = await getRoomState(cleanRoomId);
+        if (savedState) {
+          room.videoId = savedState.videoId;
+          room.currentTime = savedState.currentTime;
+          room.isPlaying = savedState.isPlaying;
+          room.anchorPosition = savedState.anchorPosition;
+          room.anchorServerTime = savedState.anchorServerTime;
+        }
+      } catch (err: any) {
+        console.error('[Redis] Error restoring state:', err.message);
+      }
+    }
+
     if (role === 'host') {
       room.hostUserId = stableUserId;
       room.hostSocketId = socket.id;
     }
+
+    // Mark connected in room model and Redis connected set
+    room.markParticipantConnected(stableUserId, socket.id);
+    await addConnectedParticipant(cleanRoomId, stableUserId);
+
+    // Restore sliding 24h TTL across all room keys on rejoin
+    await refreshRoomActivity(cleanRoomId);
 
     if (room.messages.length === 0) {
       try {
@@ -202,6 +551,16 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     if (!participant) return;
 
     socket.emit('sync_state', room.getState());
+
+    // If grace is active for another user, let this socket know immediately
+    if (activeGrace && !isReturningHostInGrace) {
+      const remainingSec = Math.max(0, Math.ceil((activeGrace.deadline - Date.now()) / 1000));
+      socket.emit('host_grace_started', {
+        hostId: activeGrace.hostId,
+        deadline: activeGrace.deadline,
+        remainingSeconds: remainingSec
+      });
+    }
 
     try {
       const queue = await getQueue(cleanRoomId);
@@ -228,9 +587,11 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
         userId: participant.userId,
         username: participant.username,
         role: participant.role,
-        joinedAt: participant.joinedAt
+        joinedAt: participant.joinedAt,
+        connected: true
       }
     });
+    io.to(cleanRoomId).emit('participants_update', room.getParticipantList());
   });
 
   socket.on('ntp_ping', ({ clientSendTime }: { clientSendTime: number }) => {
@@ -259,6 +620,14 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       sentAt
     });
     io.to(roomId).emit('sync_state', room.getState());
+    refreshRoomActivity(roomId).catch(() => {});
+    saveRoomState(roomId, {
+      videoId: room.videoId,
+      currentTime: room.currentTime,
+      isPlaying: room.isPlaying,
+      anchorPosition: room.anchorPosition,
+      anchorServerTime: room.anchorServerTime
+    }).catch(() => {});
   });
 
   socket.on('pause', ({ roomId, currentTime }) => {
@@ -280,6 +649,14 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       sentAt
     });
     io.to(roomId).emit('sync_state', room.getState());
+    refreshRoomActivity(roomId).catch(() => {});
+    saveRoomState(roomId, {
+      videoId: room.videoId,
+      currentTime: room.currentTime,
+      isPlaying: room.isPlaying,
+      anchorPosition: room.anchorPosition,
+      anchorServerTime: room.anchorServerTime
+    }).catch(() => {});
   });
 
   socket.on('seek', ({ roomId, time }) => {
@@ -301,6 +678,14 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       sentAt
     });
     io.to(roomId).emit('sync_state', room.getState());
+    refreshRoomActivity(roomId).catch(() => {});
+    saveRoomState(roomId, {
+      videoId: room.videoId,
+      currentTime: room.currentTime,
+      isPlaying: room.isPlaying,
+      anchorPosition: room.anchorPosition,
+      anchorServerTime: room.anchorServerTime
+    }).catch(() => {});
   });
 
   socket.on('playback_heartbeat', ({ roomId, currentTime, isPlaying }) => {
@@ -335,6 +720,14 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     room.updatePlaybackState({ videoId, currentTime: 0, isPlaying: true });
     io.to(roomId).emit('change_video', { videoId });
     io.to(roomId).emit('sync_state', room.getState());
+    refreshRoomActivity(roomId).catch(() => {});
+    saveRoomState(roomId, {
+      videoId: room.videoId,
+      currentTime: room.currentTime,
+      isPlaying: room.isPlaying,
+      anchorPosition: room.anchorPosition,
+      anchorServerTime: room.anchorServerTime
+    }).catch(() => {});
   });
 
   socket.on('assign_role', async ({ roomId, userId, targetSocketId, role, newRole }) => {
@@ -343,6 +736,11 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     if (!hasPermission(room, socket.id, 'assign_role')) {
       return sendError(socket, 'Permission denied: Only the Host can assign roles.');
+    }
+
+    const activeGrace = await checkHostGraceLazily(roomId);
+    if (activeGrace) {
+      return sendError(socket, 'Host-only actions are locked while waiting for host reconnection.');
     }
 
     const targetId = userId || targetSocketId;
@@ -366,6 +764,50 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return sendError(socket, 'Invalid role value.');
     }
 
+    if (targetRole === 'host') {
+      const previousHost = room.getParticipant(room.hostUserId || room.hostSocketId);
+      const updatedParticipant = room.transferHost(targetId);
+      if (updatedParticipant) {
+        try {
+          await atomicTransferHost(roomId, updatedParticipant.userId, previousHost?.userId);
+          if (hostGraceTimers.has(roomId)) {
+            clearTimeout(hostGraceTimers.get(roomId)!);
+            hostGraceTimers.delete(roomId);
+          }
+        } catch (err: any) {
+          console.error('[Redis] Error updating host transfer in Redis:', err.message);
+        }
+
+        io.to(roomId).emit('role_assigned', {
+          userId: updatedParticipant.userId,
+          username: updatedParticipant.username,
+          role: 'host',
+          participants: room.getParticipantList(),
+          hostSocketId: room.hostSocketId
+        });
+        io.to(roomId).emit('role_changed', {
+          socketId: updatedParticipant.socketId,
+          newRole: 'host',
+          hostSocketId: room.hostSocketId
+        });
+        io.to(roomId).emit('toast_notification', {
+          title: 'Host Transferred',
+          message: `${previousHost ? previousHost.username : 'Previous host'} transferred host to ${updatedParticipant.username}.`,
+          type: 'info'
+        });
+        if (updatedParticipant.socketId) {
+          io.to(updatedParticipant.socketId).emit('toast_notification', {
+            title: 'Host Status',
+            message: 'You are now the host.',
+            type: 'success'
+          });
+        }
+        io.to(roomId).emit('sync_state', room.getState());
+        refreshRoomActivity(roomId).catch(() => {});
+      }
+      return;
+    }
+
     const updatedParticipant = room.assignRole(targetId, targetRole);
     if (updatedParticipant) {
       try {
@@ -387,6 +829,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
         hostSocketId: room.hostSocketId
       });
       io.to(roomId).emit('sync_state', room.getState());
+      refreshRoomActivity(roomId).catch(() => {});
     }
   });
 
@@ -396,6 +839,11 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     if (!hasPermission(room, socket.id, 'transfer_host')) {
       return sendError(socket, 'Permission denied: Only the Host can transfer host status.');
+    }
+
+    const activeGrace = await checkHostGraceLazily(roomId);
+    if (activeGrace) {
+      return sendError(socket, 'Host-only actions are locked while waiting for host reconnection.');
     }
 
     if (!userId) {
@@ -417,10 +865,10 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     if (updatedParticipant) {
       try {
-        await assignRole(roomId, updatedParticipant.userId, 'host');
-        await setRoomHost(roomId, updatedParticipant.userId);
-        if (previousHost && previousHost.userId !== updatedParticipant.userId) {
-          await assignRole(roomId, previousHost.userId, 'moderator');
+        await atomicTransferHost(roomId, updatedParticipant.userId, previousHost?.userId);
+        if (hostGraceTimers.has(roomId)) {
+          clearTimeout(hostGraceTimers.get(roomId)!);
+          hostGraceTimers.delete(roomId);
         }
       } catch (err: any) {
         console.error('[Redis] Error updating host transfer in Redis:', err.message);
@@ -438,7 +886,20 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
         newRole: 'host',
         hostSocketId: room.hostSocketId
       });
+      io.to(roomId).emit('toast_notification', {
+        title: 'Host Transferred',
+        message: `${previousHost ? previousHost.username : 'Previous host'} transferred host to ${updatedParticipant.username}.`,
+        type: 'info'
+      });
+      if (updatedParticipant.socketId) {
+        io.to(updatedParticipant.socketId).emit('toast_notification', {
+          title: 'Host Status',
+          message: 'You are now the host.',
+          type: 'success'
+        });
+      }
       io.to(roomId).emit('sync_state', room.getState());
+      refreshRoomActivity(roomId).catch(() => {});
     }
   });
 
@@ -448,6 +909,11 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     if (!hasPermission(room, socket.id, 'remove_participant')) {
       return sendError(socket, 'Permission denied: Only the Host can remove participants.');
+    }
+
+    const activeGrace = await checkHostGraceLazily(roomId);
+    if (activeGrace) {
+      return sendError(socket, 'Host-only actions are locked while waiting for host reconnection.');
     }
 
     const targetId = userId || targetSocketId;
@@ -472,9 +938,9 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     }
 
     const disconnectKey = `${roomId}:${targetParticipant.userId}`;
-    if (pendingDisconnects.has(disconnectKey)) {
-      clearTimeout(pendingDisconnects.get(disconnectKey)!);
-      pendingDisconnects.delete(disconnectKey);
+    if (disconnectDebounceTimers.has(disconnectKey)) {
+      clearTimeout(disconnectDebounceTimers.get(disconnectKey)!);
+      disconnectDebounceTimers.delete(disconnectKey);
     }
 
     room.removeParticipant(targetParticipant.userId);
@@ -483,6 +949,13 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       await removeParticipantRole(roomId, targetParticipant.userId);
     } catch (err: any) {
       console.error('[Redis] Error removing participant role on kick:', err.message);
+    }
+
+    const remaining = await removeConnectedParticipantAtomic(roomId, targetParticipant.userId);
+    if (remaining <= 0) {
+      await setRoomTTL(roomId, EMPTY_ROOM_TTL);
+    } else {
+      refreshRoomActivity(roomId).catch(() => {});
     }
 
     io.to(roomId).emit('participant_removed', {
@@ -685,6 +1158,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     saveMessages(roomId, message).catch((err: any) => {
       console.error('[Redis] Error saving message:', err?.message);
     });
+    refreshRoomActivity(roomId).catch(() => {});
   };
 
   socket.on('send_message', handleMessage);
@@ -839,6 +1313,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
           }
         }
       }
+      refreshRoomActivity(cleanRoomId).catch(() => {});
     } catch (err: any) {
       console.error('[Redis] Error saving video request:', err.message);
       sendError(socket, 'Failed to save video request. Please try again.');
@@ -951,6 +1426,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
         }
       }
     }
+    refreshRoomActivity(cleanRoomId).catch(() => {});
   });
 
   socket.on('video_ended', async ({ roomId, videoId, participantToken }) => {
@@ -995,65 +1471,26 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     }
   });
 
-  const handleExplicitLeave = () => {
+  const handleExplicitLeave = async () => {
     const room = roomManager.getRoomBySocketId(socket.id);
     if (!room) return;
 
     const participant = room.getParticipant(socket.id);
     if (!participant) return;
 
-    const disconnectKey = `${room.id}:${participant.userId}`;
-    if (pendingDisconnects.has(disconnectKey)) {
-      clearTimeout(pendingDisconnects.get(disconnectKey)!);
-      pendingDisconnects.delete(disconnectKey);
+    const roomId = room.id;
+    const userId = participant.userId;
+    const disconnectKey = `${roomId}:${userId}`;
+
+    if (disconnectDebounceTimers.has(disconnectKey)) {
+      clearTimeout(disconnectDebounceTimers.get(disconnectKey)!);
+      disconnectDebounceTimers.delete(disconnectKey);
     }
 
-    room.removeParticipant(participant.userId);
-    removeParticipantRole(room.id, participant.userId).catch(() => {});
-    removeUserPendingRequests(room.id, participant.userId).then(async (droppedIds) => {
-      if (droppedIds.length > 0) {
-        const refreshed = await getAllRequests(room.id);
-        for (const [_, p] of room.participants.entries()) {
-          if (p.role === 'host' || p.role === 'moderator') {
-            io.sockets.sockets.get(p.socketId)?.emit('requests_sync', { requests: refreshed });
-          }
-        }
-      }
-    }).catch(() => {});
-
-    if (room.participants.size === 0) {
-      roomManager.removeRoom(room.id);
-      removeRoomHost(room.id).catch(() => {});
-    } else {
-      io.to(room.id).emit('user_left', {
-        userId: participant.userId,
-        username: participant.username,
-        participants: room.getParticipantList(),
-        hostSocketId: room.hostSocketId
-      });
-
-      const currentHost = room.getParticipant(room.hostUserId || room.hostSocketId);
-      if (currentHost) {
-        assignRole(room.id, currentHost.userId, 'host').catch(() => {});
-        setRoomHost(room.id, currentHost.userId).catch(() => {});
-        io.to(room.id).emit('role_assigned', {
-          userId: currentHost.userId,
-          username: currentHost.username,
-          role: 'host',
-          participants: room.getParticipantList(),
-          hostSocketId: room.hostSocketId
-        });
-        io.to(room.id).emit('role_changed', {
-          socketId: currentHost.socketId,
-          newRole: 'host',
-          hostSocketId: room.hostSocketId
-        });
-      }
-      io.to(room.id).emit('sync_state', room.getState());
-    }
+    socket.leave(roomId);
+    await processUserDisconnection(roomId, userId, socket.id, true);
   };
 
-  // Disconnect: apply grace period to tolerate page refreshes without dropping role or user
   const handleDisconnect = () => {
     const room = roomManager.getRoomBySocketId(socket.id);
     if (!room) return;
@@ -1068,71 +1505,30 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       username: participant.username,
       isTyping: false,
     });
-    const disconnectKey = `${roomId}:${userId}`;
 
-    if (pendingDisconnects.has(disconnectKey)) {
-      clearTimeout(pendingDisconnects.get(disconnectKey)!);
+    const disconnectKey = `${roomId}:${userId}`;
+    if (disconnectDebounceTimers.has(disconnectKey)) {
+      clearTimeout(disconnectDebounceTimers.get(disconnectKey)!);
     }
 
-    const timer = setTimeout(() => {
-      pendingDisconnects.delete(disconnectKey);
-
+    // 2-second reconnect debounce to absorb page refreshes / quick drops
+    const debounceTimer = setTimeout(async () => {
+      disconnectDebounceTimers.delete(disconnectKey);
       const currentParticipant = room.getParticipant(userId);
-      // If participant still has the disconnected socketId, they haven't reconnected
       if (currentParticipant && currentParticipant.socketId === socket.id) {
-        room.removeParticipant(userId);
-        removeParticipantRole(roomId, userId).catch(() => {});
-        removeUserPendingRequests(roomId, userId).then(async (droppedIds) => {
-          if (droppedIds.length > 0) {
-            const refreshed = await getAllRequests(roomId);
-            for (const [_, p] of room.participants.entries()) {
-              if (p.role === 'host' || p.role === 'moderator') {
-                io.sockets.sockets.get(p.socketId)?.emit('requests_sync', { requests: refreshed });
-              }
-            }
-          }
-        }).catch(() => {});
-
-        if (room.participants.size === 0) {
-          roomManager.removeRoom(roomId);
-        } else {
-          io.to(roomId).emit('user_left', {
-            userId: currentParticipant.userId,
-            username: currentParticipant.username,
-            participants: room.getParticipantList(),
-            hostSocketId: room.hostSocketId
-          });
-
-          const currentHost = room.getParticipant(room.hostUserId || room.hostSocketId);
-          if (currentHost) {
-            assignRole(roomId, currentHost.userId, 'host').catch(() => {});
-            setRoomHost(roomId, currentHost.userId).catch(() => {});
-            io.to(roomId).emit('role_assigned', {
-              userId: currentHost.userId,
-              username: currentHost.username,
-              role: 'host',
-              participants: room.getParticipantList(),
-              hostSocketId: room.hostSocketId
-            });
-            io.to(roomId).emit('role_changed', {
-              socketId: currentHost.socketId,
-              newRole: 'host',
-              hostSocketId: room.hostSocketId
-            });
-          }
-          io.to(roomId).emit('sync_state', room.getState());
-        }
+        await processUserDisconnection(roomId, userId, socket.id, false);
       }
-    }, 8000); // 8-second grace period for refresh/reconnection
+    }, 2000);
 
-    pendingDisconnects.set(disconnectKey, timer);
+    disconnectDebounceTimers.set(disconnectKey, debounceTimer);
   };
 
   socket.on('leave_room', handleExplicitLeave);
   socket.on('disconnect', handleDisconnect);
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`>>> Watch2Gether server running on port ${PORT}`);
+  await initializeServerLifecycle();
   startKeepAlive();
 });

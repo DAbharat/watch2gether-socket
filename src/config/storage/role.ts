@@ -1,12 +1,17 @@
 import redis from "../redis.js";
-
-const ROOM_TTL = Number(process.env.ROOM_TTL) || 60 * 60 * 24;
+import { ROOM_TTL, atomicTransferHost } from "./roomLifecycle.js";
 
 export async function assignRole(
   roomId: string,
   participantId: string,
   role: string
 ): Promise<void> {
+  if (role === 'host') {
+    const currentHost = await getRoomHost(roomId);
+    await atomicTransferHost(roomId, participantId, currentHost || undefined);
+    return;
+  }
+
   const key = `room:${roomId}:roles`;
 
   await redis

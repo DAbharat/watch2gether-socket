@@ -7,6 +7,7 @@ export interface ParticipantData {
   role: Role;
   joinedAt: number;
   avatar?: string;
+  connected?: boolean;
 }
 
 export interface RoomState {
@@ -100,7 +101,7 @@ export interface QueueItem {
 }
 
 export interface ClientToServerEvents {
-  join_room: (data: { roomId: string; username: string; participantId?: string; participantToken?: string }) => void;
+  join_room: (data: { roomId: string; username: string; participantId?: string; participantToken?: string; isCreating?: boolean }) => void;
   leave_room: () => void;
   ntp_ping: (data: { clientSendTime: number }) => void;
   play: (data: { roomId: string; currentTime: number; timestamp?: number }) => void;
@@ -158,4 +159,9 @@ export interface ServerToClientEvents {
   requests_sync: (data: { requests: VideoRequest[] }) => void;
   queue_updated: (data: { queue: QueueItem[] }) => void;
   request_notification: (data: { message: string; type: 'info' | 'success' | 'warning' | 'error' }) => void;
+  host_grace_started: (data: { hostId: string; deadline: number; remainingSeconds: number }) => void;
+  host_grace_cancelled: (data: { hostId: string }) => void;
+  room_not_found: (data: { roomId: string; message: string }) => void;
+  toast_notification: (data: { title?: string; message: string; type?: 'info' | 'success' | 'warning' | 'error' }) => void;
+  participants_update: (participants: ParticipantData[]) => void;
 }

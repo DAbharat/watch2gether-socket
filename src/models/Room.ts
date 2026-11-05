@@ -63,6 +63,7 @@ export class Room {
         this.socketToUserId.delete(existing.socketId);
       }
       existing.socketId = socketId;
+      existing.connected = true;
       if (username) existing.username = username;
       if (role) existing.role = role;
 
@@ -127,6 +128,54 @@ export class Room {
     }
 
     return participant;
+  }
+
+  markParticipantDisconnected(userIdOrSocketId: string): Participant | undefined {
+    const p = this.getParticipant(userIdOrSocketId);
+    if (p) {
+      p.connected = false;
+    }
+    return p;
+  }
+
+  markParticipantConnected(userId: string, socketId: string): Participant | undefined {
+    const p = this.getParticipant(userId);
+    if (p) {
+      p.connected = true;
+      if (p.socketId && p.socketId !== socketId) {
+        this.socketToUserId.delete(p.socketId);
+      }
+      p.socketId = socketId;
+      this.socketToUserId.set(socketId, userId);
+      if (p.role === 'host') {
+        this.hostSocketId = socketId;
+        this.hostUserId = userId;
+      }
+    }
+    return p;
+  }
+
+  getConnectedParticipants(): Participant[] {
+    return Array.from(this.participants.values()).filter((p) => p.connected !== false);
+  }
+
+  getConnectedCount(): number {
+    return this.getConnectedParticipants().length;
+  }
+
+  setHost(userId: string, socketId: string = ''): Participant | null {
+    const p = this.getParticipant(userId);
+    if (!p) return null;
+
+    const oldHost = this.getParticipant(this.hostUserId);
+    if (oldHost && oldHost.userId !== userId) {
+      oldHost.role = 'moderator';
+    }
+
+    p.role = 'host';
+    this.hostUserId = p.userId;
+    this.hostSocketId = socketId || p.socketId;
+    return p;
   }
 
   getParticipant(socketIdOrUserId: string): Participant | undefined {
