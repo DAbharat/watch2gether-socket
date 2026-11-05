@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { Participant } from './Participant.js';
 import { ActionRequest, ChatMessage, ParticipantData, Role, RoomState } from '../types.js';
 
@@ -293,12 +294,13 @@ export class Room {
 
   addMessage(socketIdOrUserId: string, text: string): ChatMessage {
     const p = this.getParticipant(socketIdOrUserId);
+    const cleanText = (typeof text === 'string' ? text : '').trim().slice(0, 500);
     const msg: ChatMessage = {
-      id: Math.random().toString(36).substring(2, 9),
+      id: crypto.randomBytes(8).toString('hex'),
       userId: p ? p.userId : socketIdOrUserId,
       username: p ? p.username : 'Unknown',
       role: p ? p.role : 'participant',
-      text,
+      text: cleanText,
       timestamp: Date.now(),
       avatar: p ? p.avatar : SHADCN_AVATARS[0],
     };

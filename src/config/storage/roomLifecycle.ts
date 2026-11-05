@@ -68,6 +68,18 @@ export async function isParticipantConnected(roomId: string, userId: string): Pr
   return isMember === 1;
 }
 
+export async function addKickedUser(roomId: string, userId: string): Promise<void> {
+  const key = `room:${roomId}:kicked`;
+  await redis.sadd(key, userId);
+  await redis.expire(key, ROOM_TTL);
+}
+
+export async function isUserKicked(roomId: string, userId: string): Promise<boolean> {
+  const key = `room:${roomId}:kicked`;
+  const isMember = await redis.sismember(key, userId);
+  return isMember === 1;
+}
+
 export async function clearAllConnectedSets(): Promise<number> {
   let cursor = '0';
   const setsToDelete: string[] = [];

@@ -3,8 +3,16 @@ import redis from "../../redis.js";
 
 const TOKEN_TTL = Number(process.env.ROOM_TTL) || 60 * 60 * 24;
 
-function hashToken(token: string): string {
+export function hashToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+export function generateParticipantToken(): string {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+export function generateSecureUserId(): string {
+  return `usr_${crypto.randomBytes(9).toString('hex')}`;
 }
 
 export async function storeParticipantToken(
@@ -22,18 +30,24 @@ export async function verifyParticipantToken(
   participantId: string,
   rawToken?: string
 ): Promise<boolean> {
-  if (!participantId || !rawToken) {
+  if (!roomId || !participantId || !rawToken) {
     return false;
   }
 
   const key = `room:${roomId}:token:${participantId}`;
   const storedHash = await redis.get(key);
-  const incomingHash = hashToken(rawToken);
-
   if (!storedHash) {
-    await redis.set(key, incomingHash, "EX", TOKEN_TTL);
-    return true;
+    return false;
   }
 
-  return storedHash === incomingHash;
+  const incomingHash = hashToken(rawToken);
+
+  try {
+    const a = Buffer.from(storedHash, 'hex');
+    const b = Buffer.from(incomingHash, 'hex');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
 }

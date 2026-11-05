@@ -1,5 +1,6 @@
 import express from 'express';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import { Server, Socket } from 'socket.io';
 import cors from 'cors';
 import 'dotenv/config';
@@ -25,9 +26,16 @@ import {
   checkRoomExists,
   scanAllGraceMarkers,
   EMPTY_ROOM_TTL,
+  addKickedUser,
+  isUserKicked,
 } from './config/storage/roomLifecycle.js';
 import { saveMessages, getMessages } from './config/storage/chat.js';
-import { verifyParticipantToken } from './config/storage/participant/participant.js';
+import {
+  verifyParticipantToken,
+  storeParticipantToken,
+  generateParticipantToken,
+  generateSecureUserId,
+} from './config/storage/participant/participant.js';
 import {
   saveRequest,
   getRequest,
@@ -84,6 +92,19 @@ app.get('/health', (req, res) => {
     activeRooms: roomManager.rooms.size,
     timestamp: Date.now()
   });
+});
+
+app.get('/api/room/:roomId/exists', async (req, res) => {
+  const { roomId } = req.params;
+  if (!roomId || !/^[a-zA-Z0-9_-]{1,32}$/.test(roomId)) {
+    return res.status(400).json({ exists: false, error: 'Invalid roomId' });
+  }
+  const inMemory = roomManager.hasRoom(roomId);
+  if (inMemory) {
+    return res.json({ exists: true });
+  }
+  const inRedis = await checkRoomExists(roomId);
+  return res.json({ exists: inRedis });
 });
 
 app.get('/', (req, res) => {
@@ -408,9 +429,18 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
   console.log(`[Connected] Socket ID: ${socket.id}`);
 
   socket.on('join_room', async ({ roomId, username, participantId, participantToken, isCreating }) => {
-    if (!roomId) return;
-    const cleanRoomId = roomId.trim();
-    const cleanUsername = (username || 'Guest').trim();
+    if (!roomId || typeof roomId !== 'string') return;
+    const cleanRoomId = roomId.trim().slice(0, 32);
+    if (!/^[a-zA-Z0-9_-]+$/.test(cleanRoomId)) {
+      sendError(socket, 'Invalid room ID format.');
+      return;
+    }
+
+    let cleanUsername = (typeof username === 'string' ? username : 'Guest')
+      .trim()
+      .replace(/[\x00-\x1F\x7F-\x9F]/g, '')
+      .slice(0, 30);
+    if (!cleanUsername) cleanUsername = 'Guest';
 
     // Verify room existence: check memory & Redis
     const roomInMemory = roomManager.getRoom(cleanRoomId);
@@ -426,17 +456,33 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return;
     }
 
-    let stableUserId = (participantId || '').trim();
-    if (!stableUserId) {
-      stableUserId = `usr_${Math.random().toString(36).substring(2, 11)}`;
-    }
+    const claimedId = typeof participantId === 'string' ? participantId.trim() : '';
+    const claimedToken = typeof participantToken === 'string' ? participantToken.trim() : '';
 
-    if (participantToken) {
-      const isTokenValid = await verifyParticipantToken(cleanRoomId, stableUserId, participantToken.trim());
-      if (!isTokenValid) {
-        console.warn(`[Security] Unauthorized participant token for ${stableUserId} in room ${cleanRoomId}. Assigning new ID.`);
-        stableUserId = `usr_${Math.random().toString(36).substring(2, 11)}`;
+    let stableUserId: string;
+    let isFreshIdentity = false;
+
+    if (claimedId && claimedToken) {
+      const isTokenValid = await verifyParticipantToken(cleanRoomId, claimedId, claimedToken);
+      if (isTokenValid) {
+        stableUserId = claimedId;
+      } else {
+        console.warn(`[Security] Token verification failed for claimed ID in room ${cleanRoomId}. Assigning fresh identity.`);
+        stableUserId = generateSecureUserId();
+        const freshToken = generateParticipantToken();
+        await storeParticipantToken(cleanRoomId, stableUserId, freshToken);
+        isFreshIdentity = true;
+        socket.emit('session_identity', { userId: stableUserId, token: freshToken });
       }
+    } else {
+      if (claimedId) {
+        console.warn(`[Security] Missing token for claimed ID in room ${cleanRoomId}. Assigning fresh identity.`);
+      }
+      stableUserId = generateSecureUserId();
+      const freshToken = generateParticipantToken();
+      await storeParticipantToken(cleanRoomId, stableUserId, freshToken);
+      isFreshIdentity = true;
+      socket.emit('session_identity', { userId: stableUserId, token: freshToken });
     }
 
     // Cancel 2-second reconnect debounce if user reconnected quickly
@@ -446,14 +492,35 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       disconnectDebounceTimers.delete(disconnectKey);
     }
 
+    // Check if user was kicked from this room
+    const wasKicked = await isUserKicked(cleanRoomId, stableUserId);
+    if (wasKicked) {
+      console.log(`[Security] Kicked user ${stableUserId} attempted to rejoin room ${cleanRoomId}. Denying access.`);
+      socket.emit('kicked', { message: 'You were removed from the room by the host.' });
+      return;
+    }
+
+    // Single live socket per identity: disconnect stale socket if user is already connected
+    if (roomInMemory) {
+      const existingParticipant = roomInMemory.getParticipant(stableUserId);
+      if (existingParticipant && existingParticipant.socketId && existingParticipant.socketId !== socket.id) {
+        const oldSocketId = existingParticipant.socketId;
+        const oldSocket = io.sockets.sockets.get(oldSocketId);
+        if (oldSocket) {
+          console.log(`[Security] Terminating older socket ${oldSocketId} for user ${stableUserId}. New socket: ${socket.id}`);
+          oldSocket.disconnect(true);
+        }
+      }
+    }
+
     socket.join(cleanRoomId);
 
     // Lazy check grace marker
     await checkHostGraceLazily(cleanRoomId);
 
-    // Check if user is returning host during active grace period
+    // Check if user is returning host during active grace period (only verified identities)
     const activeGrace = await getHostGrace(cleanRoomId);
-    const isReturningHostInGrace = Boolean(activeGrace && activeGrace.hostId === stableUserId);
+    const isReturningHostInGrace = Boolean(!isFreshIdentity && activeGrace && activeGrace.hostId === stableUserId);
 
     if (isReturningHostInGrace) {
       console.log(`[Lifecycle] Host ${stableUserId} returned within grace period!`);
@@ -475,10 +542,9 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     try {
       designatedHostId = await getRoomHost(cleanRoomId);
-      const existingRole = await getRole(cleanRoomId, stableUserId);
       const connectedCount = await getConnectedCount(cleanRoomId);
 
-      if (isReturningHostInGrace || (designatedHostId && stableUserId === designatedHostId)) {
+      if (!isFreshIdentity && (isReturningHostInGrace || (designatedHostId && stableUserId === designatedHostId))) {
         role = 'host';
         designatedHostId = stableUserId;
       } else if (!designatedHostId || connectedCount === 0) {
@@ -486,8 +552,14 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
         role = 'host';
         designatedHostId = stableUserId;
         await atomicTransferHost(cleanRoomId, stableUserId);
-      } else if (existingRole && ['moderator', 'participant'].includes(existingRole)) {
-        role = existingRole as Role;
+      } else if (!isFreshIdentity) {
+        const existingRole = await getRole(cleanRoomId, stableUserId);
+        if (existingRole && ['moderator', 'participant'].includes(existingRole)) {
+          role = existingRole as Role;
+        } else {
+          role = 'participant';
+          await assignRole(cleanRoomId, stableUserId, 'participant');
+        }
       } else {
         role = 'participant';
         await assignRole(cleanRoomId, stableUserId, 'participant');
@@ -928,7 +1000,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     const targetParticipant = room.getParticipant(targetId);
     if (!targetParticipant) {
-      return sendError(socket, 'Target user not found in this room.');
+      return;
     }
 
     const targetSocket = io.sockets.sockets.get(targetParticipant.socketId);
@@ -951,6 +1023,12 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       console.error('[Redis] Error removing participant role on kick:', err.message);
     }
 
+    try {
+      await addKickedUser(roomId, targetParticipant.userId);
+    } catch (err: any) {
+      console.error('[Redis] Error saving kicked user record:', err.message);
+    }
+
     const remaining = await removeConnectedParticipantAtomic(roomId, targetParticipant.userId);
     if (remaining <= 0) {
       await setRoomTTL(roomId, EMPTY_ROOM_TTL);
@@ -958,9 +1036,18 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       refreshRoomActivity(roomId).catch(() => {});
     }
 
+    const updatedParticipantList = room.getParticipantList();
+
     io.to(roomId).emit('participant_removed', {
       userId: targetParticipant.userId,
-      participants: room.getParticipantList()
+      participants: updatedParticipantList
+    });
+    io.to(roomId).emit('participants_update', updatedParticipantList);
+    io.to(roomId).emit('user_left', {
+      userId: targetParticipant.userId,
+      username: targetParticipant.username,
+      participants: updatedParticipantList,
+      hostSocketId: room.hostSocketId
     });
     io.to(roomId).emit('sync_state', room.getState());
   };
@@ -1013,7 +1100,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       }
     }
 
-    const requestId = Math.random().toString(36).substring(2, 9);
+    const requestId = crypto.randomBytes(8).toString('hex');
     const actionReq: ActionRequest = {
       requestId,
       requesterId: socket.id,
@@ -1141,7 +1228,10 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
   const handleMessage = ({ roomId, text }: { roomId: string; text: string }) => {
     const room = roomManager.getRoom(roomId);
-    if (!room || !text?.trim()) return;
+    if (!room || typeof text !== 'string' || !text.trim()) return;
+
+    const cleanText = text.trim().slice(0, 500);
+    if (!cleanText) return;
 
     const participant = room.getParticipant(socket.id);
     if (participant) {
@@ -1152,7 +1242,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       });
     }
 
-    const message = room.addMessage(socket.id, text.trim());
+    const message = room.addMessage(socket.id, cleanText);
 
     io.to(roomId).emit('chat_message', message);
     saveMessages(roomId, message).catch((err: any) => {
@@ -1198,7 +1288,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     const participant = room.getParticipant(socket.id);
     const payload = {
-      id: Math.random().toString(36).substring(2, 9),
+      id: crypto.randomBytes(8).toString('hex'),
       emoji,
       userId: participant ? participant.userId : socket.id,
       username: participant ? participant.username : 'User'
@@ -1289,7 +1379,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       return sendError(socket, 'Queue is currently full (max 20 videos).');
     }
 
-    const requestId = `req_${Math.random().toString(36).substring(2, 10)}_${Date.now()}`;
+    const requestId = `req_${crypto.randomBytes(8).toString('hex')}_${Date.now()}`;
     const newRequest: VideoRequest = {
       requestId,
       userId: participant.userId,
@@ -1527,7 +1617,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
   socket.on('disconnect', handleDisconnect);
 });
 
-server.listen(PORT, async () => {
+server.listen(Number(PORT), '0.0.0.0', 2048, async () => {
   console.log(`>>> Watch2Gether server running on port ${PORT}`);
   await initializeServerLifecycle();
   startKeepAlive();

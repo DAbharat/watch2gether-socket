@@ -163,5 +163,6 @@ export interface ServerToClientEvents {
   host_grace_cancelled: (data: { hostId: string }) => void;
   room_not_found: (data: { roomId: string; message: string }) => void;
   toast_notification: (data: { title?: string; message: string; type?: 'info' | 'success' | 'warning' | 'error' }) => void;
+  session_identity: (data: { userId: string; token: string }) => void;
   participants_update: (participants: ParticipantData[]) => void;
 }

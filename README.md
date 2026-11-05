@@ -19,16 +19,21 @@ This service acts as the central real-time authority in the Watch2Gether platfor
    - [Role-Based Access Control (RBAC) & Request Pipeline](#role-based-access-control-rbac--request-pipeline)
 4. [Storage Strategy: Ephemeral Memory vs. Databases](#storage-strategy-ephemeral-memory-vs-databases)
 5. [Technology Stack & Design Choices](#technology-stack--design-choices)
-6. [Benchmark & Concurrency Performance](#benchmark--concurrency-performance)
+6. [Identity & Security Trade-offs](#identity--security-trade-offs)
+   - [How Identity Works](#how-identity-works)
+   - [Identity Spoofing Protections](#identity-spoofing-protections)
+   - [Room Departure & Rejoin Mechanics](#room-departure--rejoin-mechanics)
+   - [Known Limitations / Future Work](#known-limitations--future-work)
+7. [Benchmark & Concurrency Performance](#benchmark--concurrency-performance)
    - [Localhost Concurrency Benchmarks (Raw Engine Performance)](#localhost-concurrency-benchmarks-raw-engine-performance)
    - [Remote Cloud Concurrency Benchmarks (Render Production Environment)](#remote-cloud-concurrency-benchmarks-render-production-environment)
    - [Architectural Optimization Progression](#architectural-optimization-progression)
-7. [Socket API Specification](#socket-api-specification)
+8. [Socket API Specification](#socket-api-specification)
    - [Client-to-Server Events](#client-to-server-events)
    - [Server-to-Client Events](#server-to-client-events)
-8. [Codebase Structure](#codebase-structure)
-9. [Configuration & Environment Variables](#configuration--environment-variables)
-10. [Local Development & Deployment](#local-development--deployment)
+9. [Codebase Structure](#codebase-structure)
+10. [Configuration & Environment Variables](#configuration--environment-variables)
+11. [Local Development & Deployment](#local-development--deployment)
 
 ---
 
@@ -342,6 +347,46 @@ The storage architecture strictly separates concerns:
 
 ---
 
+## Identity & Security Trade-offs
+
+### How Identity Works
+There are no user accounts. Each participant receives a cryptographically random 256-bit bearer token stored in their browser session, while the server stores only its SHA-256 hash in Redis, scoped strictly to the room (`room:<roomId>:token:<userId>`). The token is verified once during `join_room`, attaching the verified identity to the socket connection. All subsequent events (playback control, role changes, video requests, chat messages) derive identity and roles exclusively from the socket registry and Redis, never trusting client-supplied payloads. Only the public `userId` is ever broadcast to other peers.
+
+### Identity Spoofing Protections
+- **Mandatory Verification**: A claimed `participantId` is honored only if `participantId` and `participantToken` are both provided and match the stored SHA-256 hash in Redis via constant-time comparison (`crypto.timingSafeEqual`).
+- **Automatic Downgrade**: Missing, unknown, or invalid tokens instantly generate a fresh anonymous Participant identity, preventing attackers from adopting another user's public `userId` or inheriting Host/Moderator roles.
+- **Single Live Socket Enforcement**: A single identity can only maintain one active socket per room. When a verified identity reconnects, any older socket for that user is terminated (`disconnect(true)`).
+- **Room-Scoped & Ephemeral**: Tokens are strictly room-bound and expire alongside the room's sliding 24-hour Redis TTL.
+- **Strict Permission Gates**: Playback, queue moderation, and host transfers are enforced on the server using verified session roles.
+
+### Room Departure & Rejoin Mechanics
+- **Graceful Client Departure**: When a user leaves a room, the client preserves the room metadata, creation timestamp, and invite link in `sessionStorage` (`wtg_last_left_room`) and navigates to the landing page with query context (`/?left=<roomId>`).
+- **Interactive Rejoin Popover**: On the landing page, a Shadcn popover displays:
+  - Header: **Rejoin Room**
+  - Explanatory guidance: *"You can also join the same room by pasting the invitation link in the 'Join with code' option in landing page."*
+  - An input box with the room invitation link pre-pasted and ready to copy.
+  - Action buttons: **Rejoin** (peach accent button) for instant re-entry with their verified session intact, and **Cancel** to dismiss and clear cached references.
+- **Multi-Path Re-entry**: The "Join with Code" tab on the landing page is simultaneously pre-populated with the invitation link, ensuring multiple frictionless re-entry paths.
+- **Strict 24-Hour Expiration Deadline**: Popovers only trigger if the room is within its active 24-hour lifecycle (`now < expiresAt`). If the user leaves near the deadline and arrives after it has elapsed (e.g. at 24:00:01), the expired state is immediately purged and the popover never displays.
+- **Single-Show UX Safeguard**: To prevent interrupting users on subsequent visits or page refreshes, the popover marks `shown: true` and cleans the URL query parameter via `window.history.replaceState` immediately upon the first view. Dismissing or canceling completely wipes cached references. Additionally, `/api/room/:roomId/exists` provides instant server-side room validation across memory and Redis.
+
+### Known Limitations / Future Work
+
+#### Known Limitations
+1. **Bearer Token Browser Binding**: A bearer token identifies a browser session rather than an authenticated human. Anyone with access to the raw token (e.g. via device sharing or XSS) can impersonate that participant until the session expires. *Mitigations*: Input sanitization, JSX plain-text rendering, HTTPS transport, and never exposing tokens in URLs, logs, or peer broadcasts.
+2. **Ephemeral Identity Recreation**: A kicked or removed user can rejoin as a fresh anonymous identity because bans are keyed to `userId` and there are no permanent accounts. Preventing this completely requires user authentication or IP-based rate limiting.
+3. **Storage Exposure**: Tokens are persisted in browser client storage (`localStorage` / `sessionStorage`) due to cross-domain deployment (Vercel frontend and Render backend), precluding the immediate use of `httpOnly` cookies without a shared apex domain.
+4. **Temporary Session State**: Rooms and identities are ephemeral by design (Redis 24h sliding TTL). There is no permanent audit log or persistent identity across different rooms.
+
+#### Future Work
+- **Optional User Authentication**: OAuth / magic links for persistent profiles and host verification.
+- **`httpOnly` Session Cookies**: Unified reverse proxy or shared apex domain to isolate bearer tokens from JavaScript execution contexts.
+- **Per-IP Rate Limiting & Abuse Throttling**: Preventing spam and ban-evasion via Redis sliding-window IP tracking.
+- **Reconnection Token Rotation**: Rotating bearer credentials upon each successful reconnection cycle.
+- **Horizontal Clustering**: Enabling `@socket.io/redis-adapter` for multi-server node broadcast fanout.
+
+---
+
 ## Benchmark & Concurrency Performance
 
 The socket server was benchmarked using a dedicated multi-socket load test harness running 100 concurrent clients across realistic room conditions and maximum stress flood conditions.
@@ -405,6 +450,33 @@ Tested locally on `http://localhost:4000` to evaluate raw engine throughput and 
 +--------------------------------+----------------------------------------+
 ```
 
+#### Localhost Scenario C: Mega-Scale Multi-Room Stress (10,000 Viewers across 100 Rooms)
+- **Command**: `node loadtest.js --more stress`
+- **Target**: `http://localhost:4000` (Local Node.js + In-Memory Manager + Redis)
+- **Concurrency**: 100 distinct rooms with 100 concurrent users each (10,000 total simulated viewers).
+
+```
++-------------------------------------------------------------------------+
+| Metric                         | Value                                  |
++--------------------------------+----------------------------------------+
+| Simulated Room Viewers         | 10,000 concurrent clients              |
+| Total Rooms / Users Per Room   | 100 rooms / 100 users per room         |
+| Successful Connections         | 9,220 (92.2% connection success)       |
+| Connection Failures            | 1,269 (client OS ephemeral port limit) |
+| Messages Ingested by Server    | 3,600                                  |
+| Broadcast Packets Delivered    | 118,589 packets                        |
+| Sustained Delivered Throughput | 5,929.4 msg/sec                        |
+| Reactions Processed            | 15                                     |
+| Min Broadcast Latency          | 8 ms                                   |
+| Average (Mean) Latency         | 6,069.2 ms                             |
+| Median Latency (p50)           | 5,091 ms                               |
+| 95th Percentile Latency (p95)  | 13,378 ms                              |
+| 99th Percentile Latency (p99)  | 14,937 ms                              |
+| Max Latency                    | 15,963 ms                              |
+| Errors                         | 1,269                                  |
++--------------------------------+----------------------------------------+
+```
+
 ---
 
 ### Remote Cloud Concurrency Benchmarks (Render Production Environment)
@@ -450,6 +522,59 @@ Tested against a deployed container on Render (`https://your-server.onrender.com
 | Median Latency (p50)                   | 3,443 ms                       |
 | Average (Mean) Latency                 | 4,272.1 ms                     |
 | Error Count                            | 0                              |
++-------------------------------------------------------------------------+
+```
+
+#### Cloud Scenario C: Extreme Cloud Stress (10,000 Users — Proxy Boundary Saturation)
+- **Command**: `node loadtest.js --more stress`
+- **Target**: `https://watch2gether-socket.onrender.com`
+- **Infrastructure Observation**: Tests Render's reverse proxy ceiling (1,024 file descriptor hard cap on Free/Starter tiers).
+
+```
++-------------------------------------------------------------------------+
+| Metric                                 | Result                         |
++----------------------------------------+--------------------------------+
+| Attempted Viewers                      | 10,000 concurrent users        |
+| Total Rooms / Users Per Room           | 100 rooms / 100 users per room |
+| Connected Sockets                      | 1,035 (Render proxy ceiling)   |
+| Connection Failures                    | 8,787 (Rejected at proxy gate) |
+| Messages Ingested by Server            | 1,600                          |
+| Broadcast Packets Delivered            | 6,059 packets                  |
+| Delivered Throughput                   | 302.9 msg/sec                  |
+| Minimum Latency                        | 364 ms                         |
+| Median Latency (p50)                   | 3,759 ms                       |
+| Average (Mean) Latency                 | 7,560.7 ms                     |
+| 95th Percentile Latency (p95)          | 16,269 ms                      |
+| 99th Percentile Latency (p99)          | 16,564 ms                      |
+| Maximum Recorded Latency               | 16,621 ms                      |
+| Errors                                 | 8,787                          |
++-------------------------------------------------------------------------+
+```
+
+#### Cloud Scenario D: Render Proxy-Capped Benchmark (1,000 Users — Optimized)
+- **Command**: `node loadtest.js --render`
+- **Target**: `https://watch2gether-socket.onrender.com`
+- **Optimization**: Calibrated to 20 rooms × 50 users/room (1,000 users) to operate cleanly within Render proxy boundaries.
+
+```
++-------------------------------------------------------------------------+
+| Metric                                 | Result                         |
++----------------------------------------+--------------------------------+
+| Simulated Room Viewers                 | 1,000 concurrent users         |
+| Total Rooms / Users Per Room           | 20 rooms / 50 users per room   |
+| Connected Sockets                      | 693 connected                  |
+| Connection Failures                    | 2                              |
+| Messages Ingested by Server            | 760                            |
+| Broadcast Packets Delivered            | 23,305 packets                 |
+| Delivered Throughput                   | 1,165.3 msg/sec                |
+| Reactions Delivered                    | 12                             |
+| Minimum Latency                        | 284 ms                         |
+| Median Latency (p50)                   | 698 ms                         |
+| Average (Mean) Latency                 | 694.1 ms                       |
+| 95th Percentile Latency (p95)          | 1,091 ms                       |
+| 99th Percentile Latency (p99)          | 1,299 ms                       |
+| Maximum Recorded Latency               | 1,506 ms                       |
+| Errors                                 | 2                              |
 +-------------------------------------------------------------------------+
 ```
 
